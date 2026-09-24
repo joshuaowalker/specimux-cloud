@@ -7,6 +7,11 @@ gets the same live dashboard and results the suite produces on a laptop:
 demultiplexing, consensus sequences per specimen, and identification
 against a reference database.
 
+specimux-cloud is a joint project used by two non-profit research labs
+focused on fungal diversity. If you think it may be useful for your own
+work, please contact the author (for example by
+[opening an issue](https://github.com/joshuaowalker/specimux-cloud/issues)).
+
 - **[Uploading a run](#uploading-a-run):** you have a job code and a run
   folder. Start here.
 - **[Creating runs](#creating-runs):** the console, sharing a dashboard
