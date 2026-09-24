@@ -8,6 +8,7 @@ import threading
 import time
 
 import httpx
+import pytest
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -203,3 +204,70 @@ def test_an_older_run_api_is_not_sent_progress_again(tmp_path):
     up.report_progress("a.pod5", 10, 100, 1.0)
     up.report_progress("a.pod5", 20, 100, 1.0)
     assert len(calls) == 1 and up.reports is False
+
+
+def test_version_parsing():
+    from specimux_cloud.versioning import older, parse_version, uploader_version
+    assert parse_version("0.1.10") == (0, 1, 10) and parse_version("0.2.0rc1") == (0, 2, 0)
+    assert older("0.1.9", "0.1.10") and not older("0.1.10", "0.1.9") and not older("0.1.1", "0.1.1")
+    assert uploader_version("specimux-cloud-uploader/0.1.1") == "0.1.1"
+    assert uploader_version("python-httpx/0.27.0") == "0.1.0"          # 0.1.0 named nothing
+    assert uploader_version(None) == "0.1.0"
+
+
+def test_an_uploader_below_the_minimum_is_refused_with_the_upgrade_command(api, tmp_path, caplog):
+    """The operator's minimum turns an old uploader away with 426 and the
+    command that fixes it, on every job-code route; the uploader itself
+    checks /v1/version first and stops before sending anything; a host
+    completing from the run page is not an uploader and is never refused."""
+    import logging
+    from specimux_cloud import __version__
+    from specimux_cloud.uploader.cli import check_service
+    client, service, _ = api
+    run = _create(client)
+    hdr = {"Authorization": f"JobCode {run['job_code']}"}
+    info = client.get("/v1/version").json()["uploader"]
+    assert info == {"minimum": None, "latest": __version__}
+    old = {**hdr, "User-Agent": "python-httpx/0.27.0"}                  # what 0.1.0 sends
+    assert client.post(f"/v1/runs/{run['id']}/uploads", json={"files": ["a.fastq"]}, headers=old).status_code == 200
+
+    service.config.min_uploader = "9.0"
+    for method, path, body in (("post", "uploads", {"files": ["a.fastq"]}), ("get", "upload", None),
+                               ("post", "upload/progress", {"sent": 1}), ("post", "complete", None)):
+        r = client.request(method.upper(), f"/v1/runs/{run['id']}/{path}", json=body, headers=old)
+        assert r.status_code == 426, (path, r.status_code)
+        assert "pip install -U specimux-cloud" in r.json()["error"] and "0.1.0" in r.json()["error"]
+    new = {**hdr, "User-Agent": "specimux-cloud-uploader/9.0.0"}
+    assert client.get(f"/v1/runs/{run['id']}/upload", headers=new).status_code == 200
+    assert client.get("/v1/version").json()["uploader"]["minimum"] == "9.0"
+    with pytest.raises(SystemExit, match="too old for this service"):
+        check_service("http://testserver", client)
+    folder = tmp_path / "reads"
+    folder.mkdir()
+    (folder / "a.fastq").write_text("@r\nA\n+\nI\n")
+    up = Uploader("http://testserver", run["job_code"], folder, settle_s=0)
+    _patch_client(up, client)
+    with pytest.raises(SystemExit, match="Upgrade with: pip install -U specimux-cloud"):
+        up.run(once=True)
+    assert not up.done                                                  # nothing was sent
+    assert client.post(f"/v1/runs/{run['id']}/complete", headers={"X-Service-Key": KEY}).status_code in (200, 409)
+
+    # a newer release out: said once, nothing stops
+    service.config.min_uploader = None
+    import specimux_cloud.runapi.app as app_mod
+    with caplog.at_level(logging.INFO, logger="specimux_cloud.uploader"):
+        orig = client.get
+
+        def newer(url, **kw):
+            r = orig(url, **kw)
+            if url.endswith("/v1/version"):
+                return httpx.Response(200, json={**r.json(), "uploader": {"minimum": None, "latest": "99.0"}})
+            return r
+        client.get = newer
+        try:
+            check_service("http://testserver", client)
+        finally:
+            client.get = orig
+    assert "specimux-cloud 99.0 is available" in caplog.text
+    # a service that doesn't answer is no reason to stop
+    check_service("http://127.0.0.1:9")

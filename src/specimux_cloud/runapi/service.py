@@ -172,6 +172,10 @@ class ServiceConfig:
     # how many runs each stage runs at once (SPECIMUX_STAGE_SLOTS): a cost
     # cap, and for dorado the G-instance quota (8 vCPUs = two xlarge)
     stage_slots: dict = field(default_factory=lambda: dict(DEFAULT_STAGE_SLOTS))
+    # The oldest uploader still served (SPECIMUX_MIN_UPLOADER); None serves
+    # every one. Raise it only when an old uploader truly cannot work
+    # (specimux_cloud/versioning.py).
+    min_uploader: Optional[str] = None
 
     def slots(self, stage: str) -> int:
         return max(1, int(self.stage_slots.get(stage, 1)))

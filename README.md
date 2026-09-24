@@ -236,6 +236,12 @@ reachable only inside the VPC). The region is the profile's, or
 `cdk-outputs.json`. A new engine image takes effect on the next run
 (Batch pulls `:latest` per job); a new run API image needs the ECS
 service rolled (`aws ecs update-service --force-new-deployment`).
+Release a new specimux-cloud to PyPI before rolling a run API of that
+version: `GET /v1/version` offers the run API's own release to uploaders
+as the latest. Keep `/v1` backward compatible (see `runapi/app.py` and
+docs/DESIGN.md, "Contracts and versioning"); if an old uploader truly
+cannot be served any more, set `SPECIMUX_MIN_UPLOADER` on the run API and
+it refuses older uploaders with the command to upgrade.
 
 Dorado models are baked into the dorado image (`DORADO_MODELS` in
 `docker/dorado.Dockerfile`), and the model names the run API offers are

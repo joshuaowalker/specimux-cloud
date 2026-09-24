@@ -16,4 +16,4 @@ Four parts, matching docs/DESIGN.md:
   Batch, DynamoDB). The run API's logic is the same over both.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

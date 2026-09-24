@@ -33,7 +33,7 @@ from typing import Optional
 
 import httpx
 
-from .cli import Uploader
+from .cli import Uploader, check_service
 
 logger = logging.getLogger("specimux_cloud.submit")
 
@@ -99,6 +99,7 @@ def run(argv: Optional[list[str]] = None) -> int:
         return 2
     if kind == "pod5":
         spec["basecall"] = basecall
+    check_service(base)   # a too-old uploader stops before it creates a run
     files = {"primers": (args.primers.name, args.primers.read_bytes()),
              "specimens": (args.specimens.name, args.specimens.read_bytes())}
     data = {"spec": json.dumps(spec), "client_token": f"submit-{time.time()}"}

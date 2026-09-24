@@ -1,7 +1,7 @@
 # The run API image. Needs the suite (viewer app factory, pages) but none
 # of the bioinformatics tools.
 FROM python:3.12-slim
-ARG SUITE_SPEC="specimux-suite==0.3.5"
+ARG SUITE_SPEC="specimux-suite==0.3.6"
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir "${SUITE_SPEC}"

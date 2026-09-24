@@ -1269,3 +1269,12 @@ def test_a_reference_from_before_grants_is_usable_by_the_host_whose_runs_used_it
     assert client.get(f"/v1/references/sha256/{sha}", headers={"X-Service-Key": KEY}).status_code == 200
     assert service.storage.head(f"references/grants/{sha}/dev")
     assert client.get(f"/v1/references/sha256/{sha}", headers={"X-Service-Key": other_key}).status_code == 404
+
+
+def test_every_refusal_carries_error_and_the_older_detail(api):
+    client, service, _ = api
+    run = _create(client)
+    r = client.post(f"/v1/runs/{run['id']}/uploads", json={"files": ["a"]})       # no job code
+    assert r.status_code == 403 and r.json()["error"] == r.json()["detail"] == "Job code required"
+    r = client.get(f"/v1/runs/{run['id']}", headers={"X-Service-Key": "nope"})
+    assert r.status_code in (401, 403) and r.json()["error"]

@@ -11,6 +11,12 @@ checksum match what storage holds is skipped), forwards MinKNOW's
 the manifest of everything it uploaded (key, size, ETag) so the run API
 can verify the input is exactly what was sent. The uploader talks only to
 the run API; it never needs a login.
+
+It names itself and its version in every request's User-Agent, and checks
+``/v1/version`` first: a service that no longer serves this version stops
+it with the upgrade command before anything is sent (versioning.py).
+Installed uploaders are old for a long time, so the run API keeps the
+routes they call backward compatible (runapi/app.py).
 """
 
 import argparse
@@ -23,6 +29,8 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
+
+from ..versioning import UPGRADE_COMMAND, older, uploader_user_agent
 
 logger = logging.getLogger("specimux_cloud.uploader")
 
@@ -67,6 +75,26 @@ def _md5(path: Path) -> str:
     return h.hexdigest()
 
 
+def check_service(base: str, client: Optional[httpx.Client] = None) -> None:
+    """Before anything is sent: stop if the service no longer serves this
+    uploader's version (it names a minimum), and say so once if a newer
+    one is out. A service that doesn't answer is no reason to stop; the
+    upload itself will say what is wrong."""
+    from .. import __version__
+    try:
+        r = (client or httpx).get(f"{base.rstrip('/')}/v1/version", timeout=15.0,
+                                  headers={"User-Agent": uploader_user_agent()})
+        info = (r.json().get("uploader") or {}) if r.status_code == 200 else {}
+    except (httpx.HTTPError, ValueError):
+        return
+    minimum, latest = info.get("minimum"), info.get("latest")
+    if minimum and older(__version__, minimum):
+        raise SystemExit(f"This uploader ({__version__}) is too old for this service, which needs {minimum} "
+                         f"or later. Upgrade with: {UPGRADE_COMMAND}")
+    if latest and older(__version__, latest):
+        logger.info(f"specimux-cloud {latest} is available (this is {__version__}): {UPGRADE_COMMAND}")
+
+
 class Uploader:
     def __init__(self, run_api: str, job_code: str, folder: Path, settle_s: float = 30.0,
                  state_path: Optional[Path] = None, include_failed: bool = False):
@@ -80,10 +108,14 @@ class Uploader:
         self.state_path = state_path or (self.folder / ".specimux-upload.json")
         self.headers = {"Authorization": f"JobCode {job_code}"}
         self.reports = True   # False once the run API turns out not to take progress reports
-        # reports go out while the file's PUT is in flight on self.client
-        self.report_client = httpx.Client(timeout=httpx.Timeout(10.0))
+
         self.done: dict[str, dict] = self._load_state()
-        self.client = httpx.Client(timeout=httpx.Timeout(600.0, connect=30.0))
+        # every request names this uploader and its version: the run API
+        # refuses one older than its minimum (versioning.py)
+        agent = {"User-Agent": uploader_user_agent()}
+        self.client = httpx.Client(timeout=httpx.Timeout(600.0, connect=30.0), headers=agent)
+        # reports go out while the file's PUT is in flight on self.client
+        self.report_client = httpx.Client(timeout=httpx.Timeout(10.0), headers=agent)
 
     # --- state (resume) ---
 
@@ -212,6 +244,7 @@ class Uploader:
         button), which the uploader notices within ``status_s``. After
         ``hint_after_s`` with every file up and nothing new (MinKNOW writes
         a file every few minutes while sequencing), it says how to finish."""
+        check_service(self.base, self.client)
         told_waiting = False
         idle_since = time.monotonic()
         todo = self.pending()

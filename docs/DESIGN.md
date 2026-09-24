@@ -621,7 +621,34 @@ The integration surfaces are few and explicit:
 | C2 ingest and commands | engine jobs and the run API | event batches (opaque JSON with version and generation), command long-poll and ack, inputs, exit report | `/v1`, additive |
 | C3 dashboard | the run API and the suite's pages | `api/state`, `events`, `api/specimens`, `api/sequence`, commands; the injected runtime config | pages come from the run API's pinned suite, so they always match |
 | C4 job API | a host and the run API | service keys, options, create, status, cancel, retry, delete, results, token minting, the authorize redirect, public sharing, load, references | `/v1`, additive only; the one contract that crosses an organisational boundary; `tests/test_contract.py` checks it against any deployment |
-| C5 upload API | uploader and run API | presign, status, complete with manifest | `/v1` |
+| C5 upload API | uploader and run API | presign, status, progress, complete with manifest | `/v1`, additive only; a minimum uploader version refuses what can no longer be served |
+
+**Backward compatibility is the rule for `/v1`.** Every caller of the run
+API is upgraded on its own schedule, never in step with it: uploaders on
+lab machines months later, hosts on their own deploys, and engine and
+dorado jobs keep the wrapper they started with through a run API roll
+(a live job may run for days). So routes change only additively: new
+routes, new optional request fields, new response fields. A route or
+field is never removed or renamed, an optional field never becomes
+required, a field never changes meaning or type, and a status code a
+caller acts on (409 closed uploads, 404 unknown reference, 426 too old)
+keeps its meaning. What cannot be additive gets new routes (`/v2/...`)
+beside the old ones until their callers are gone. The module docstring of
+`runapi/app.py` says the same where the routes are written. Errors are
+`{"error": ...}`; refusals raised before a route runs also carry the
+older `detail` key.
+
+**Uploader versions.** The uploader names itself in its User-Agent
+(`specimux-cloud-uploader/<version>`, from 0.1.1; one that names nothing
+is 0.1.0). `GET /v1/version` returns `uploader: {minimum, latest}`, where
+`latest` is the run API's own release (so a release reaches PyPI before a
+run API that names it is rolled) and `minimum` is the operator's
+`SPECIMUX_MIN_UPLOADER`, unset by default. At startup the uploader stops
+with the upgrade command if it is below the minimum, before it sends
+anything, and says once if a newer release is out. The run API enforces
+the minimum too, with 426 and the upgrade command on every job-code route,
+since uploaders already installed check nothing. The minimum is raised
+only when an old uploader truly cannot work.
 
 - **The run API passes events through as opaque JSON**; only the viewer's
   state rebuild depends on the suite, and replaying older logs under a

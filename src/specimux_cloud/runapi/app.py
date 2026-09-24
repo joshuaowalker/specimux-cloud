@@ -1,5 +1,24 @@
 """The run API's HTTP surface, all under /v1 (DESIGN.md "The run API").
 
+COMPATIBILITY: every route here has callers this repository does not
+upgrade in step with the run API. Keep /v1 backward compatible:
+
+- uploaders (``specimux-cloud upload``/``submit``) live on lab machines and
+  are upgraded whenever someone gets around to it, months later;
+- hosts (mycomap.org) are other people's code, deployed on their schedule;
+- engine and dorado jobs already running keep the wrapper they started
+  with through a run API roll, and a job may run for days.
+
+So change routes only additively: new routes, new optional request
+fields, new response fields. Never remove or rename a route or a field,
+make an optional field required, change a field's meaning or type, or
+change a status code a caller acts on (409 closed uploads, 426 too old,
+404 unknown reference, ...). A change that cannot be additive gets new
+routes (/v2/...) beside the old ones, and the old ones stay until their
+callers are gone. An uploader too old to serve at all is refused with
+426 and the upgrade command (SPECIMUX_MIN_UPLOADER,
+specimux_cloud/versioning.py), never broken silently.
+
 Callers and their credentials:
 
 - a host (mycomap.org, the console): ``X-Service-Key`` on job control,
@@ -40,6 +59,7 @@ from specimux_suite.web.pages import STATIC_DIR
 
 from ..backends.local import DirectoryStorage
 from .auth import PUBLIC_SCOPE
+from ..versioning import UPGRADE_COMMAND, older, uploader_version
 from .service import COMMANDS, DORADO_STAGE, ENGINE_STAGE, RunService, ServiceError
 
 logger = logging.getLogger(__name__)
@@ -98,21 +118,40 @@ def create_app(service: RunService, console: bool = True) -> FastAPI:
     async def _service_error(request: Request, exc: ServiceError):
         return JSONResponse(status_code=exc.status, content={"error": exc.message})
 
+    @app.exception_handler(HTTPException)
+    async def _http_error(request: Request, exc: HTTPException):
+        # errors are {"error": ...} (the documented shape); "detail" is what
+        # these refusals carried before, kept for any caller reading it
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.detail, "detail": exc.detail},
+                            headers=getattr(exc, "headers", None))
+
     # --- credentials ---
 
     def service_key(x_service_key: Optional[str] = Header(default=None)) -> dict:
         """The calling host: ``{"host": record, "label": key label}``."""
         return service.authenticate_key(x_service_key or "")
 
-    def check_job_code(run_id: str, authorization: Optional[str], open_only: bool = True) -> dict:
+    def check_uploader(user_agent: Optional[str]) -> None:
+        """Refuse an uploader older than the configured minimum, with the
+        command that fixes it (it prints the error it gets)."""
+        minimum = service.config.min_uploader
+        version = uploader_version(user_agent)
+        if minimum and older(version, minimum):
+            raise ServiceError(426, f"This uploader ({version}) is too old for this service, which needs "
+                                     f"{minimum} or later. Upgrade with: {UPGRADE_COMMAND}")
+
+    def check_job_code(run_id: str, authorization: Optional[str], open_only: bool = True,
+                       user_agent: Optional[str] = None) -> dict:
+        check_uploader(user_agent)
         scheme, _, code = (authorization or "").partition(" ")
         rid, _, secret = code.partition(".")
         if scheme.lower() != "jobcode" or rid != run_id:
             raise HTTPException(403, "Job code required")
         return service.check_job_code(run_id, secret, open_only=open_only)
 
-    def job_code(run_id: str, authorization: Optional[str] = Header(default=None)) -> dict:
-        return check_job_code(run_id, authorization)
+    def job_code(run_id: str, authorization: Optional[str] = Header(default=None),
+                 user_agent: Optional[str] = Header(default=None)) -> dict:
+        return check_job_code(run_id, authorization, user_agent=user_agent)
 
     def any_job(run_id: str, x_job_secret: Optional[str] = Header(default=None)) -> dict:
         """The calling job: its run, its stage and that stage's generation
@@ -265,7 +304,10 @@ def create_app(service: RunService, console: bool = True) -> FastAPI:
     @app.get("/v1/version")
     async def version():
         from .. import __version__
-        return {"suite": suite_version, "cloud": __version__}
+        # uploader.latest is this service's own release: publish a release
+        # to PyPI before rolling a run API that names it
+        return {"suite": suite_version, "cloud": __version__,
+                "uploader": {"minimum": service.config.min_uploader, "latest": __version__}}
 
     @app.get("/v1/runs/{run_id}/{package}.zip")
     def results(run_id: str, package: str, request: Request):
@@ -300,20 +342,22 @@ def create_app(service: RunService, console: bool = True) -> FastAPI:
         return await run_in_threadpool(service.record_upload_progress, run_id, body)
 
     @app.get("/v1/runs/{run_id}/upload")
-    def upload_status(run_id: str, authorization: Optional[str] = Header(default=None)):
+    def upload_status(run_id: str, authorization: Optional[str] = Header(default=None),
+                      user_agent: Optional[str] = Header(default=None)):
         """Whether the run still takes uploads: a watching uploader stops
         once the run was completed another way (the run page's button)."""
-        run = check_job_code(run_id, authorization, open_only=False)
+        run = check_job_code(run_id, authorization, open_only=False, user_agent=user_agent)
         return {"run_id": run_id, "state": run["state"], "open": service.uploads_open(run)}
 
     @app.post("/v1/runs/{run_id}/complete")
     async def complete(run_id: str, request: Request, authorization: Optional[str] = Header(default=None),
-                       x_service_key: Optional[str] = Header(default=None)):
+                       x_service_key: Optional[str] = Header(default=None),
+                       user_agent: Optional[str] = Header(default=None)):
         # the uploader (job code) or the job page (the owning host's key)
         if x_service_key:
             service.get_run(run_id, service.authenticate_key(x_service_key)["host"]["id"])
         else:
-            job_code(run_id, authorization)
+            job_code(run_id, authorization, user_agent)
         body = await request.json() if int(request.headers.get("content-length") or 0) > 0 else {}
         return await run_in_threadpool(service.complete, run_id, (body or {}).get("manifest"))
 
@@ -495,7 +539,8 @@ def build_local_service(data_dir: Path, base_url: str, dev_key: Optional[str] = 
     data_dir = Path(data_dir)
     secret = session_secret or _local_secret(data_dir)
     config = ServiceConfig(data_dir=data_dir, base_url=base_url, session_secret=secret,
-                           engine_api_url=engine_api_url, engine_extra_args=list(engine_extra_args or []))
+                           engine_api_url=engine_api_url, engine_extra_args=list(engine_extra_args or []),
+                           min_uploader=os.environ.get("SPECIMUX_MIN_UPLOADER") or None)
     service = RunService(
         config,
         storage=DirectoryStorage(data_dir / "storage", base_url=base_url, secret=secret),
@@ -532,7 +577,9 @@ def build_aws_service(base_url: str, engine_extra_args: Optional[list] = None) -
     service), AWS_REGION; for the dorado stage SPECIMUX_BATCH_QUEUE_DORADO,
     SPECIMUX_BATCH_JOBDEF_DORADO and SPECIMUX_DORADO_MODELS (the model
     complexes the dorado image bakes, comma separated); SPECIMUX_STAGE_SLOTS
-    (``engine=2,dorado=2``) for how many runs each stage runs at once. Hosts and their
+    (``engine=2,dorado=2``) for how many runs each stage runs at once;
+    SPECIMUX_MIN_UPLOADER (unset: every uploader) for the oldest uploader
+    served. Hosts and their
     keys live in the table (``specimux-cloud hosts``).
     """
     from ..backends.aws import BatchLauncher, DynamoStore, S3Storage, SqsQueue
@@ -540,6 +587,7 @@ def build_aws_service(base_url: str, engine_extra_args: Optional[list] = None) -
     env = os.environ
     region = env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION")
     config = ServiceConfig(
+        min_uploader=env.get("SPECIMUX_MIN_UPLOADER") or None,
         data_dir=Path(env.get("SPECIMUX_DATA_DIR", "/data")),
         base_url=base_url,
         session_secret=env["SPECIMUX_SESSION_SECRET"],

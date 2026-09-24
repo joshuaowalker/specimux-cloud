@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "specimux-cloud"
-version = "0.1.0"
+version = "0.1.1"
 description = "Hosted specimux-suite: the uploader, run API, console and compute jobs for sequencing runs in the cloud"
 readme = "README.md"
 license = { text = "BSD-3-Clause" }
@@ -24,7 +24,7 @@ classifiers = [
 keywords = ["bioinformatics", "nanopore", "sequencing", "barcoding", "cloud"]
 dependencies = [
     # The engine, the viewer app factory, the commands facade and the pages
-    "specimux-suite>=0.3.5",
+    "specimux-suite>=0.3.6",
     "fastapi>=0.104",
     "uvicorn>=0.24",
     "sse-starlette>=1.8",
