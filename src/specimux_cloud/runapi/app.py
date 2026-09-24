@@ -353,6 +353,15 @@ def create_app(service: RunService, console: bool = True) -> FastAPI:
         service.ack_command(run_id, message_id)
         return {"acked": message_id}
 
+    @app.post("/v1/runs/{run_id}/basecall-progress")
+    async def basecall_progress(run_id: str, request: Request, job: dict = Depends(dorado_job)):
+        """The dorado job's progress on its current file (best effort)."""
+        body = await request.json()
+        if not isinstance(body, dict) or "generation" not in body:
+            raise ServiceError(400, "A progress report is a JSON object with the generation")
+        return await run_in_threadpool(service.record_basecall_progress, run_id, int(body["generation"]),
+                                       body.get("file") or "", body.get("reads"), body.get("estimate"))
+
     @app.post("/v1/runs/{run_id}/basecalled")
     async def basecalled(run_id: str, request: Request, job: dict = Depends(dorado_job)):
         """The dorado job delivered one FASTQ (PUT to the key the bundle gave it)."""

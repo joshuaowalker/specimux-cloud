@@ -41,6 +41,12 @@ from specimux_cloud.stopsignal import STOPPED_EXIT, STOPPED_REPORT_PATIENCE_S, S
 logger = logging.getLogger("specimux_cloud.dorado")
 
 USER_AGENT = "specimux-cloud-dorado"
+# Progress while a file is basecalled: reads called so far (counted in
+# dorado's FASTQ output) and an estimate of the file's reads from its size,
+# reported this often. POD5 bytes per read until a file of this job gives
+# the real figure: 9.5k to 10.4k per file on full-ITS runs.
+PROGRESS_S = 30.0
+DEFAULT_BYTES_PER_READ = 10_000
 
 
 class RunApiClient:
@@ -64,6 +70,15 @@ class RunApiClient:
         return self._retrying(f"/v1/runs/{self.run_id}/basecalled",
                               {"generation": generation, "name": name, "key": key,
                                "reads_in": reads_in, "reads_out": reads_out}, patience_s=600.0)
+
+    def report_progress(self, generation: int, name: str, reads: int, estimate: int) -> None:
+        """Best effort, for the run page: never retried, never fatal."""
+        try:
+            self._call(f"/v1/runs/{self.run_id}/basecall-progress",
+                       {"generation": generation, "file": name, "reads": reads, "estimate": estimate},
+                       timeout=10.0)
+        except Exception as e:
+            logger.debug(f"Progress report not delivered: {e}")
 
     def report_exit(self, generation: int, exit_code: int, log_tail: str, patience_s: float = 1800.0) -> dict:
         return self._retrying(f"/v1/runs/{self.run_id}/exit",
@@ -150,10 +165,32 @@ def build_dorado_command(basecall: dict, pod5: Path, device: str, binary: str = 
     return cmd
 
 
+class FastqCounter:
+    """Reads in a FASTQ being written, counted incrementally (four lines a
+    record; only the bytes added since the last count are read)."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.offset = 0
+        self.lines = 0
+
+    def reads(self) -> int:
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(self.offset)
+                while chunk := f.read(1 << 20):
+                    self.lines += chunk.count(b"\n")
+                    self.offset += len(chunk)
+        except OSError:
+            pass
+        return self.lines // 4
+
+
 def basecall_file(entry: dict, bundle: dict, scratch: Path, device: str, binary: str, log,
-                  stop: Optional[StopSignal] = None) -> tuple[int, int]:
+                  stop: Optional[StopSignal] = None, progress=None) -> tuple[int, int]:
     """One POD5 file: download, basecall, filter, upload. Returns the read
-    counts (before and after the length filter)."""
+    counts (before and after the length filter). ``progress(reads)`` is
+    called every PROGRESS_S while dorado runs."""
     name = entry["name"]
     out_name = (name[:-5] if name.lower().endswith(".pod5") else name) + ".fastq"
     target = bundle["fastq_uploads"][out_name]
@@ -174,7 +211,14 @@ def basecall_file(entry: dict, bundle: dict, scratch: Path, device: str, binary:
             if stop is not None:
                 stop.child = proc
             try:
-                rc = proc.wait()
+                counter = FastqCounter(raw)
+                while True:
+                    try:
+                        rc = proc.wait(timeout=PROGRESS_S)
+                        break
+                    except subprocess.TimeoutExpired:
+                        if progress is not None:
+                            progress(counter.reads())
             finally:
                 if stop is not None:
                     stop.child = None
@@ -230,9 +274,16 @@ def run(argv: Optional[list[str]] = None) -> int:
                 if (e["name"][:-5] if e["name"].lower().endswith(".pod5") else e["name"]) + ".fastq" not in done]
         logger.info(f"{len(bundle['pod5'])} POD5 files, {len(done)} already basecalled, {len(todo)} to do; "
                     f"model {bundle.get('basecall', {}).get('model')} on {args.device}")
+        bytes_per_read = DEFAULT_BYTES_PER_READ
         with open(log_path, "ab") as log:
             for i, entry in enumerate(todo, 1):
-                reads_in, reads_out = basecall_file(entry, bundle, scratch, args.device, args.dorado, log, stop)
+                estimate = max(1, int((entry.get("size") or 0) / bytes_per_read))
+                report = (lambda reads, name=entry["name"], est=estimate:
+                          api.report_progress(args.generation, name, reads, est))
+                reads_in, reads_out = basecall_file(entry, bundle, scratch, args.device, args.dorado, log, stop,
+                                                    progress=report)
+                if reads_in and entry.get("size"):
+                    bytes_per_read = entry["size"] / reads_in   # this run's own reads, for the next estimate
                 out_name = (entry["name"][:-5] if entry["name"].lower().endswith(".pod5") else entry["name"]) + ".fastq"
                 api.report_basecalled(args.generation, out_name, bundle["fastq_uploads"][out_name]["key"],
                                       reads_in, reads_out)

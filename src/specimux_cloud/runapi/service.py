@@ -1203,8 +1203,22 @@ class RunService:
         progress.update({"files": files, "done": len(files), "total": len(expected),
                          "reads_in": sum(f["reads_in"] for f in files),
                          "reads_out": sum(f["reads_out"] for f in files)})
-        self.store.update_run(run_id, {"basecalling": progress})
+        self.store.update_run(run_id, {"basecalling": progress, "basecall_current": None})
         return {"done": progress["done"], "total": progress["total"]}
+
+    def record_basecall_progress(self, run_id: str, generation: int, name: str, reads: int,
+                                 estimate: int) -> dict:
+        """The dorado job's progress on the file it is basecalling (reads
+        called so far, and its estimate of the file's reads), for the run
+        page."""
+        run = self.check_stage_generation(run_id, DORADO_STAGE, generation)
+        if not stage_of(run, DORADO_STAGE).get("active"):
+            raise ServiceError(409, f"Run is {run['state']}; not basecalling")
+        if not isinstance(reads, int) or not isinstance(estimate, int) or reads < 0 or estimate < 0:
+            raise ServiceError(400, "reads and estimate must be non-negative integers")
+        self.store.update_run(run_id, {"basecall_current": {"file": str(name)[:255], "reads": reads,
+                                                            "estimate": estimate, "at": time.time()}})
+        return {"ok": True}
 
     def ingest(self, run_id: str, generation: int, events: list[dict]) -> dict:
         run = self.check_stage_generation(run_id, ENGINE_STAGE, generation)

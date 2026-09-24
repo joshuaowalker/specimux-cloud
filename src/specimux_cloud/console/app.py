@@ -62,6 +62,18 @@ def upload_text(up: dict, now: Optional[float] = None) -> str:
     return text
 
 
+def basecall_current_text(cur: dict, now: Optional[float] = None) -> str:
+    """The file being basecalled, from the dorado job's last report while it
+    is recent: about how far along (the file's reads are estimated from its
+    size, so never past 99%) and the reads called so far."""
+    now = time.time() if now is None else now
+    if not cur.get("file") or now - float(cur.get("at") or 0) > 120:
+        return ""
+    reads, estimate = cur.get("reads") or 0, cur.get("estimate") or 0
+    pct = f"about {min(99, round(100 * reads / estimate))}%, " if estimate else ""
+    return f"{cur['file']}: {pct}{reads:,} reads called"
+
+
 def _fernet(secret: str):
     from cryptography.fernet import Fernet
     return Fernet(base64.urlsafe_b64encode(hashlib.sha256(f"{secret}:console".encode()).digest()))
@@ -397,7 +409,12 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
             text = f"{done} of {total} file(s)" + (" done" if bc.get("finished") else "")
             if bc.get("reads_in"):
                 text += f" · {bc['reads_in']:,} reads called, {bc.get('reads_out', 0):,} within the length window"
+            current = basecall_current_text(run.get("basecall_current") or {}) if state == "basecalling" else ""
+            if current:
+                text += f" · now {current}"
             rows.append(("Basecalling", esc(text)))
+        elif state == "basecalling" and run.get("basecall_current"):
+            rows.append(("Basecalling", esc("now " + basecall_current_text(run["basecall_current"]))))
         if run.get("effective_config"):
             rows.append(("Effective configuration", f"<code>{esc(json.dumps(run['effective_config']))}</code>"))
         if run.get("exit"):

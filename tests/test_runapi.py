@@ -671,6 +671,20 @@ def test_pod5_run_is_basecalled_then_run(api):
     a = bundle["fastq_uploads"]["a.fastq"]
     assert a["key"] == f"runs/u42/{rid}/fastq/a.fastq"
     assert client.get(bundle["pod5"][1]["url"]).content == b"POD5:a.pod5"
+    # progress on the file in flight, for the run page; cleared once delivered
+    r = client.post(f"/v1/runs/{rid}/basecall-progress",
+                    json={"generation": 1, "file": "a.pod5", "reads": 1200, "estimate": 4000}, headers=dor)
+    assert r.status_code == 200
+    cur = client.get(f"/v1/runs/{rid}", headers={"X-Service-Key": KEY}).json()["basecall_current"]
+    assert (cur["file"], cur["reads"], cur["estimate"]) == ("a.pod5", 1200, 4000)
+    from specimux_cloud.console.app import basecall_current_text
+    assert basecall_current_text(cur) == "a.pod5: about 30%, 1,200 reads called"
+    assert basecall_current_text({**cur, "reads": 9000}) == "a.pod5: about 99%, 9,000 reads called"  # an estimate
+    assert basecall_current_text({**cur, "at": cur["at"] - 300}) == ""                               # stale
+    assert client.post(f"/v1/runs/{rid}/basecall-progress", json={"generation": 1, "reads": -1, "estimate": 1},
+                       headers=dor).status_code == 400
+    assert client.post(f"/v1/runs/{rid}/basecall-progress", json={"generation": 2, "reads": 1, "estimate": 1},
+                       headers=dor).status_code == 409                                                # another generation
     # a report before the upload, a report for a stranger's file
     r = client.post(f"/v1/runs/{rid}/basecalled", json={"generation": 1, "name": "a.fastq", "key": a["key"]}, headers=dor)
     assert r.status_code == 409
@@ -682,6 +696,7 @@ def test_pod5_run_is_basecalled_then_run(api):
     assert r.status_code == 200 and r.json() == {"done": 1, "total": 2}
     st = client.get(f"/v1/runs/{rid}", headers={"X-Service-Key": KEY}).json()
     assert st["basecalling"]["done"] == 1 and st["basecalling"]["reads_in"] == 10 and st["basecalling"]["reads_out"] == 1
+    assert st["basecall_current"] is None
     # a second attempt of the job sees what the first delivered
     assert client.get(f"/v1/runs/{rid}/job", headers=dor).json()["basecalled"] == ["a.fastq"]
     # exit 0 with a file missing is a failure: the listing is the truth
