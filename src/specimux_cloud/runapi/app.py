@@ -290,6 +290,15 @@ def create_app(service: RunService, console: bool = True) -> FastAPI:
             raise ServiceError(400, "files: a list of file names")
         return await run_in_threadpool(service.presign_uploads, run_id, [str(n) for n in names])
 
+    @app.post("/v1/runs/{run_id}/upload/progress")
+    async def upload_progress(run_id: str, request: Request, run: dict = Depends(job_code)):
+        """The uploader's progress on the file it is sending, for the run
+        page (the service sees a file only once its upload finishes)."""
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ServiceError(400, "A progress report is a JSON object")
+        return await run_in_threadpool(service.record_upload_progress, run_id, body)
+
     @app.get("/v1/runs/{run_id}/upload")
     def upload_status(run_id: str, authorization: Optional[str] = Header(default=None)):
         """Whether the run still takes uploads: a watching uploader stops

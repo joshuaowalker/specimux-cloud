@@ -47,7 +47,9 @@ specimux-cloud upload --run-api https://runs.specimux.com --job-code <code> --on
 The folder can be a MinKNOW run folder or any folder of `.pod5` or
 `.fastq` / `.fastq.gz` files; subfolders are included. `--once` uploads
 what is there and tells the service the upload is complete, and
-processing starts. The run's type (POD5 or FASTQ) was chosen when the run
+processing starts. While a file is sent the uploader prints its progress
+every ten seconds (percentage, speed, time left), and the run page shows
+the files received and the file in flight. The run's type (POD5 or FASTQ) was chosen when the run
 was created, so upload the matching files.
 
 ### While sequencing

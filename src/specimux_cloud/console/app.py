@@ -37,6 +37,31 @@ COOKIE = "specimux_console"
 SESSION_TTL_S = 12 * 3600
 
 
+def _size(n) -> str:
+    """Bytes for people: 2.1 GB, 950 MB."""
+    n = float(n or 0)
+    for unit in ("bytes", "KB", "MB", "GB", "TB"):
+        if n < 1000 or unit == "TB":
+            return f"{n:,.0f} {unit}" if unit == "bytes" else f"{n:,.1f} {unit}"
+        n /= 1000
+
+
+def upload_text(up: dict, now: Optional[float] = None) -> str:
+    """The run page's upload line: whole files received, and the file in
+    flight from the uploader's last report while it is recent."""
+    now = time.time() if now is None else now
+    text = f"{up.get('files', 0)} file(s) received ({_size(up.get('bytes'))})"
+    pr = up.get("progress") or {}
+    size, sent = pr.get("size") or 0, pr.get("sent") or 0
+    if pr.get("file") and size and sent < size and now - float(pr.get("at") or 0) < 60:
+        text += f" · sending {pr['file']}: {100 * sent / size:.0f}% of {_size(size)}"
+        rate = pr.get("rate") or 0
+        if rate > 0:
+            left = (size - sent) / rate
+            text += f" at {_size(rate)}/s, about {max(1, round(left / 60))} min left"
+    return text
+
+
 def _fernet(secret: str):
     from cryptography.fernet import Fernet
     return Fernet(base64.urlsafe_b64encode(hashlib.sha256(f"{secret}:console".encode()).digest()))
@@ -362,6 +387,8 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
                 ("Submitted by", esc(run.get("user_id"))),
                 ("Spec", f"<code>{esc(json.dumps(run.get('spec') or {}))}</code>"),
                 ("Versions", esc(json.dumps(run.get("versions") or {})))]
+        if run.get("upload") and not run.get("manifest"):
+            rows.append(("Upload", esc(upload_text(run["upload"]))))
         if run.get("manifest"):
             rows.append(("Input", f"{len(run['manifest'])} file(s), {sum(m.get('size', 0) for m in run['manifest']):,} bytes"))
         if run.get("basecalling"):

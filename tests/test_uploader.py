@@ -6,6 +6,8 @@ import json
 import os
 import threading
 import time
+
+import httpx
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -145,3 +147,59 @@ def test_minknow_failed_reads_are_left_out(api, tmp_path):
     assert [p.name for p in up.pending()] == ["p_0.fastq.gz"]
     everything = Uploader("http://testserver", run["job_code"], folder, settle_s=0, include_failed=True)
     assert sorted(p.name for p in everything.pending()) == ["f_0.fastq.gz", "p_0.fastq.gz"]
+
+
+def test_upload_progress_is_logged_and_shown_on_the_run_page(api, tmp_path, caplog, monkeypatch):
+    """A file in flight: the uploader logs its progress and reports it to the
+    run API, whose run record carries what has arrived plus that report, and
+    the console turns it into the run page's upload line."""
+    import logging
+    from specimux_cloud.console.app import upload_text
+    from specimux_cloud.uploader import cli as up_cli
+    monkeypatch.setattr(up_cli, "PROGRESS_LOG_S", 0.0)
+    monkeypatch.setattr(up_cli, "PROGRESS_REPORT_S", 0.0)
+    monkeypatch.setattr(up_cli, "CHUNK", 1000)
+    client, service, _ = api
+    run = _create(client)
+    folder = tmp_path / "reads"
+    folder.mkdir()
+    data = b"@r\n" + b"A" * 5000 + b"\n+\n" + b"I" * 5000 + b"\n"
+    (folder / "a.fastq").write_bytes(data)
+    up = Uploader("http://testserver", run["job_code"], folder, settle_s=0)
+    _patch_client(up, client)
+    up.report_client = client
+    with caplog.at_level(logging.INFO, logger="specimux_cloud.uploader"):
+        up.upload(folder / "a.fastq")
+    assert "a.fastq: " in caplog.text and "% of" in caplog.text
+    assert "1 file(s), 10.0 KB uploaded so far" in caplog.text
+    rec = client.get(f"/v1/runs/{run['id']}", headers={"X-Service-Key": KEY}).json()
+    assert rec["upload"]["files"] == 1 and rec["upload"]["bytes"] == len(data)
+    pr = rec["upload"]["progress"]
+    assert pr["file"] == "a.fastq" and 0 < pr["sent"] < pr["size"] == len(data)
+    text = upload_text({**rec["upload"], "progress": {**pr, "sent": 2000, "rate": 10.0, "at": time.time()}})
+    assert text.startswith("1 file(s) received (10.0 KB) · sending a.fastq: 20% of 10.0 KB at 10 bytes/s, about 13 min left")
+    assert "min left" in text
+    stale = upload_text({**rec["upload"], "progress": {**pr, "at": time.time() - 120}})
+    assert stale == "1 file(s) received (10.0 KB)"                  # an old report is not shown
+    hdr = {"Authorization": f"JobCode {run['job_code']}"}
+    assert client.post(f"/v1/runs/{run['id']}/upload/progress", json={"sent": -1}, headers=hdr).status_code == 400
+    assert client.post(f"/v1/runs/{run['id']}/upload/progress", json={"sent": 1}).status_code in (401, 403)
+    client.post(f"/v1/runs/{run['id']}/complete", headers={"X-Service-Key": KEY})
+    assert client.post(f"/v1/runs/{run['id']}/upload/progress", json={"sent": 1}, headers=hdr).status_code == 409
+    assert "upload" not in client.get(f"/v1/runs/{run['id']}", headers={"X-Service-Key": KEY}).json()
+
+
+def test_an_older_run_api_is_not_sent_progress_again(tmp_path):
+    folder = tmp_path / "reads"
+    folder.mkdir()
+    up = Uploader("http://testserver", "r1.secret", folder, settle_s=0)
+    calls = []
+
+    class Old:
+        def post(self, url, **kw):
+            calls.append(url)
+            return httpx.Response(404)
+    up.report_client = Old()
+    up.report_progress("a.pod5", 10, 100, 1.0)
+    up.report_progress("a.pod5", 20, 100, 1.0)
+    assert len(calls) == 1 and up.reports is False

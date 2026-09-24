@@ -111,7 +111,10 @@ def parse_stage_slots(text: str) -> dict:
     return out
 # A launch intent younger than this may still be in flight; reconcile leaves it
 INTENT_GRACE_S = 120.0
-LOAD_CACHE_S = 15.0
+LOAD_CACHE_S = 15
+# While a run takes uploads its record carries what has arrived (a listing
+# of its archive, cached this long) and the uploader's last progress report
+UPLOAD_LIST_CACHE_S = 10.0
 # How long a public session's check of the run's sharing may be cached
 PUBLIC_CHECK_S = 5.0
 # At most this many live event streams per run (public links can travel)
@@ -258,6 +261,7 @@ class RunService:
         self._load_lock = threading.Lock()
         self._load_cache: Optional[dict] = None
         self._sharing_cache: dict[str, tuple[float, dict]] = {}
+        self._upload_cache: dict[str, tuple[float, dict]] = {}
         self.config.work_root.mkdir(parents=True, exist_ok=True)
 
     # --- paths and keys ---
@@ -451,6 +455,8 @@ class RunService:
                        for name, rec in (run.get("stages") or {}).items()}
         d["pending_commands"] = [c["id"] for c in self.store.list_commands(run["id"], pending_only=True)]
         d["uploads_open"] = self.uploads_open(run)
+        if d["uploads_open"]:
+            d["upload"] = self._upload_received(run)
         pub = run.get("public") or {}
         d.pop("public", None)
         d["public"] = {"enabled": bool(pub.get("enabled")), "allow_starring": pub.get("allow_starring", True),
@@ -875,12 +881,64 @@ class RunService:
             run = self.store.update_run(run_id, touch)
         except ConflictError:
             raise ServiceError(409, f"Uploads are closed: run is {self.get_run(run_id)['state']}")
+        self._forget_upload_listing(run_id)
         # A live run's engine starts with its first upload request (or when
         # an engine slot frees); a batch run's on complete
         if run["spec"].get("mode") == "live" and run["state"] == UPLOADING \
                 and not stage_of(run, ENGINE_STAGE).get("active"):
             self._try_launch(run_id)
         return {"run_id": run_id, "uploads": urls}
+
+    def _upload_received(self, run: dict) -> dict:
+        """What has arrived so far: whole files in the archive (a file shows
+        once its upload finishes), and the uploader's last report on the
+        file in flight (uploaders from 0.1.1 send one)."""
+        now = time.time()
+        with self._views_lock:
+            hit = self._upload_cache.get(run["id"])
+        if hit and now - hit[0] < UPLOAD_LIST_CACHE_S:
+            received = hit[1]
+        else:
+            prefix = f"{self.archive_prefix(run)}/{run['spec'].get('input', 'fastq')}/"
+            objs = self.storage.list(prefix)
+            received = {"files": len(objs), "bytes": sum(o.size for o in objs)}
+            with self._views_lock:
+                self._upload_cache[run["id"]] = (now, received)
+        out = dict(received)
+        if run.get("upload_progress"):
+            out["progress"] = dict(run["upload_progress"])
+        return out
+
+    def record_upload_progress(self, run_id: str, report: dict) -> dict:
+        """The uploader's progress on the file in flight, shown on the run
+        page. A report is upload activity (the idle clock restarts), since a
+        large file can take a while to send."""
+        def num(key):
+            v = report.get(key)
+            if v is None:
+                return None
+            if not isinstance(v, (int, float)) or v < 0:
+                raise ServiceError(400, f"{key} must be a non-negative number")
+            return v
+        name = str(report.get("file") or "")[:255]
+        progress = {"file": name, "sent": num("sent"), "size": num("size"), "rate": num("rate"),
+                    "files_done": num("files_done"), "bytes_done": num("bytes_done"), "at": time.time()}
+
+        def touch(cur: dict) -> dict:
+            if not self.uploads_open(cur):
+                raise ConflictError(f"run {run_id} is {cur['state']}")
+            return {"upload_progress": progress, "last_upload": time.time()}
+        try:
+            self.store.update_run(run_id, touch)
+        except ConflictError:
+            raise ServiceError(409, f"Uploads are closed: run is {self.get_run(run_id)['state']}")
+        self._forget_upload_listing(run_id)
+        return {"ok": True}
+
+    def _forget_upload_listing(self, run_id: str) -> None:
+        # the uploader moved on (a file may have finished): list again
+        with self._views_lock:
+            self._upload_cache.pop(run_id, None)
 
     def complete(self, run_id: str, manifest: Optional[list[dict]] = None) -> dict:
         """No more input. The manifest (key, size, etag per object) fixes

@@ -30,6 +30,29 @@ INPUT_SUFFIXES = (".fastq", ".fq", ".fastq.gz", ".fq.gz", ".pod5")
 
 
 FAILED_DIRS = ("fastq_fail", "pod5_fail")   # MinKNOW's reads that failed its quality filter
+# Progress while a file is sent: a log line this often, and a report to the
+# run API (its run page shows it) this often
+PROGRESS_LOG_S = 10.0
+PROGRESS_REPORT_S = 15.0
+CHUNK = 1 << 20
+
+
+def _size(n) -> str:
+    """Bytes for people: 2.1 GB, 950 MB."""
+    n = float(n or 0)
+    for unit in ("bytes", "KB", "MB", "GB", "TB"):
+        if n < 1000 or unit == "TB":
+            return f"{n:,.0f} {unit}" if unit == "bytes" else f"{n:,.1f} {unit}"
+        n /= 1000
+
+
+def _duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 90:
+        return f"{seconds} s"
+    if seconds < 5400:
+        return f"{round(seconds / 60)} min"
+    return f"{seconds / 3600:.1f} h"
 
 
 def _is_input(path: Path) -> bool:
@@ -56,6 +79,9 @@ class Uploader:
         self.include_failed = include_failed
         self.state_path = state_path or (self.folder / ".specimux-upload.json")
         self.headers = {"Authorization": f"JobCode {job_code}"}
+        self.reports = True   # False once the run API turns out not to take progress reports
+        # reports go out while the file's PUT is in flight on self.client
+        self.report_client = httpx.Client(timeout=httpx.Timeout(10.0))
         self.done: dict[str, dict] = self._load_state()
         self.client = httpx.Client(timeout=httpx.Timeout(600.0, connect=30.0))
 
@@ -95,15 +121,55 @@ class Uploader:
                              json={"files": [name]}, headers=self.headers)
         r.raise_for_status()
         target = r.json()["uploads"][name]
-        with open(path, "rb") as f:
-            put = self.client.put(target["url"], content=f)
+        started = time.monotonic()
+        put = self.client.put(target["url"], content=self._stream(path, size, started),
+                              headers={"Content-Length": str(size)})   # storage takes no chunked body
         put.raise_for_status()
         etag = (put.headers.get("etag") or "").strip('"')
         record = {"key": target["key"], "size": size, "md5": md5, "etag": etag, "uploaded": time.time()}
         self.done[name] = record
         self._save_state()
-        logger.info(f"Uploaded {name} ({size:,} bytes)")
+        took = time.monotonic() - started
+        total = sum(r.get("size", 0) for r in self.done.values())
+        logger.info(f"Uploaded {name} ({_size(size)} in {_duration(took)}"
+                    + (f", {_size(size / took)}/s" if took >= 1 else "")
+                    + f"); {len(self.done)} file(s), {_size(total)} uploaded so far")
         return record
+
+    def _stream(self, path: Path, size: int, started: float):
+        """The file in chunks, logging progress every PROGRESS_LOG_S and
+        reporting it to the run API every PROGRESS_REPORT_S."""
+        sent = 0
+        logged = reported = started
+        with open(path, "rb") as f:
+            while chunk := f.read(CHUNK):
+                sent += len(chunk)
+                yield chunk
+                now = time.monotonic()
+                rate = sent / (now - started) if now > started else 0.0
+                if now - logged >= PROGRESS_LOG_S and sent < size:
+                    logged = now
+                    left = f", about {_duration((size - sent) / rate)} left" if rate else ""
+                    logger.info(f"  {path.name}: {100 * sent / size:.0f}% of {_size(size)}"
+                                f" at {_size(rate)}/s{left}")
+                if now - reported >= PROGRESS_REPORT_S and sent < size:
+                    reported = now
+                    self.report_progress(path.name, sent, size, rate)
+
+    def report_progress(self, name: str, sent: int, size: int, rate: float) -> None:
+        """Best effort: the run page shows it; an upload never waits on it or
+        fails for it, and a run API without the route is asked no more."""
+        if not self.reports:
+            return
+        body = {"file": name, "sent": sent, "size": size, "rate": round(rate, 1),
+                "files_done": len(self.done), "bytes_done": sum(r.get("size", 0) for r in self.done.values())}
+        try:
+            r = self.report_client.post(f"{self.base}/v1/runs/{self.run_id}/upload/progress", json=body,
+                                        headers=self.headers)
+            if r.status_code in (404, 405):
+                self.reports = False
+        except httpx.HTTPError:
+            pass
 
     # --- the folder ---
 
@@ -148,6 +214,10 @@ class Uploader:
         a file every few minutes while sequencing), it says how to finish."""
         told_waiting = False
         idle_since = time.monotonic()
+        todo = self.pending()
+        if todo:
+            logger.info(f"{len(todo)} file(s) to upload ({_size(sum(p.stat().st_size for p in todo))})"
+                        + (f"; {len(self.done)} already uploaded" if self.done else ""))
         last_status = time.monotonic()
         while True:
             for p in self.pending():
