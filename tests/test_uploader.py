@@ -110,7 +110,10 @@ def test_a_watching_uploader_stops_when_the_run_is_completed_elsewhere(api, tmp_
         r = client.post(f"/v1/runs/{run['id']}/complete", headers={"X-Service-Key": KEY})
         assert r.status_code == 200 and r.json()["state"] == "running"
         assert done.wait(5)
-    assert result["status"] == {"run_id": run["id"], "state": "running", "open": False}
+    # uploads closed; complete launches the run, so the uploader's poll may
+    # land just before the launch (input_complete) or after it (running)
+    assert result["status"]["open"] is False and result["status"]["run_id"] == run["id"]
+    assert result["status"]["state"] in ("input_complete", "running")
     # the status route checks the code even for a closed run
     assert client.get(f"/v1/runs/{run['id']}/upload",
                       headers={"Authorization": f"JobCode {run['id']}.nope"}).status_code == 403
