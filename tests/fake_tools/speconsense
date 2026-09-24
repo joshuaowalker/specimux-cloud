@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Stand-in speconsense: one cluster named <sid>-1.v1 sized by read count; slow enough to command mid-run."""
+import os, sys, time
+from pathlib import Path
+args = sys.argv[1:]
+out = Path(args[args.index("-O") + 1]); out.mkdir(parents=True, exist_ok=True)
+fastq = Path(args[0]); sid = fastq.stem
+n = fastq.read_text().count("@")
+time.sleep(float(os.environ.get("FAKE_SPECONSENSE_SLEEP", "0")))
+(out / f"{sid}-all.fasta").write_text(f">{sid}-1.v1 size={n} ric={n}\nACGTACGTAC\n")

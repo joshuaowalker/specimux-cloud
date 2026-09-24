@@ -1,0 +1,228 @@
+"""The uploader: move a run folder to the cloud with a job code.
+
+    specimux-cloud upload --job-code <run>.<secret> --run-api URL <folder>
+
+Watches the folder (or takes it as is with ``--once``), uploads each
+FASTQ or POD5 file once it has stopped growing (not those under MinKNOW's
+``fastq_fail``/``pod5_fail`` folders unless ``--include-failed``), straight to storage over a
+presigned URL from the run API, resumes on restart (a file whose size and
+checksum match what storage holds is skipped), forwards MinKNOW's
+``final_summary_*.txt`` when it appears, and then calls ``complete`` with
+the manifest of everything it uploaded (key, size, ETag) so the run API
+can verify the input is exactly what was sent. The uploader talks only to
+the run API; it never needs a login.
+"""
+
+import argparse
+import hashlib
+import json
+import logging
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+import httpx
+
+logger = logging.getLogger("specimux_cloud.uploader")
+
+INPUT_SUFFIXES = (".fastq", ".fq", ".fastq.gz", ".fq.gz", ".pod5")
+
+
+FAILED_DIRS = ("fastq_fail", "pod5_fail")   # MinKNOW's reads that failed its quality filter
+
+
+def _is_input(path: Path) -> bool:
+    return path.is_file() and any(path.name.endswith(s) for s in INPUT_SUFFIXES) and not path.name.startswith(".")
+
+
+def _md5(path: Path) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+class Uploader:
+    def __init__(self, run_api: str, job_code: str, folder: Path, settle_s: float = 30.0,
+                 state_path: Optional[Path] = None, include_failed: bool = False):
+        self.base = run_api.rstrip("/")
+        self.run_id, _, self.secret = job_code.partition(".")
+        if not self.run_id or not self.secret:
+            raise SystemExit("A job code looks like <run id>.<secret>")
+        self.folder = Path(folder)
+        self.settle_s = settle_s
+        self.include_failed = include_failed
+        self.state_path = state_path or (self.folder / ".specimux-upload.json")
+        self.headers = {"Authorization": f"JobCode {job_code}"}
+        self.done: dict[str, dict] = self._load_state()
+        self.client = httpx.Client(timeout=httpx.Timeout(600.0, connect=30.0))
+
+    # --- state (resume) ---
+
+    def _load_state(self) -> dict:
+        try:
+            data = json.loads(self.state_path.read_text())
+            if data.get("run_id") == self.run_id:
+                return data.get("uploaded", {})
+        except (OSError, ValueError):
+            pass
+        return {}
+
+    def _save_state(self) -> None:
+        tmp = self.state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"run_id": self.run_id, "uploaded": self.done}, indent=1))
+        tmp.replace(self.state_path)
+
+    # --- one file ---
+
+    def stable(self, path: Path) -> bool:
+        """True once the file has not grown for settle_s (MinKNOW closes files
+        in one go, but a copy in progress must not be uploaded half-way)."""
+        size = path.stat().st_size
+        age = time.time() - path.stat().st_mtime
+        return size > 0 and age >= self.settle_s
+
+    def upload(self, path: Path) -> dict:
+        name = path.name
+        size = path.stat().st_size
+        md5 = _md5(path)
+        prev = self.done.get(name)
+        if prev and prev.get("size") == size and prev.get("md5") == md5:
+            return prev
+        r = self.client.post(f"{self.base}/v1/runs/{self.run_id}/uploads",
+                             json={"files": [name]}, headers=self.headers)
+        r.raise_for_status()
+        target = r.json()["uploads"][name]
+        with open(path, "rb") as f:
+            put = self.client.put(target["url"], content=f)
+        put.raise_for_status()
+        etag = (put.headers.get("etag") or "").strip('"')
+        record = {"key": target["key"], "size": size, "md5": md5, "etag": etag, "uploaded": time.time()}
+        self.done[name] = record
+        self._save_state()
+        logger.info(f"Uploaded {name} ({size:,} bytes)")
+        return record
+
+    # --- the folder ---
+
+    def pending(self) -> list[Path]:
+        files = sorted(p for p in self.folder.rglob("*") if _is_input(p)
+                       and (self.include_failed or not any(d in FAILED_DIRS for d in p.relative_to(self.folder).parts[:-1])))
+        out = []
+        for p in files:
+            rec = self.done.get(p.name)
+            if rec and rec.get("size") == p.stat().st_size:
+                continue
+            out.append(p)
+        return out
+
+    def final_summary(self) -> Optional[Path]:
+        hits = sorted(self.folder.rglob("final_summary_*.txt"))
+        return hits[0] if hits else None
+
+    def complete(self) -> dict:
+        manifest = [{"key": r["key"], "size": r["size"], "etag": r["etag"]} for r in self.done.values()]
+        summary = self.final_summary()
+        body = {"manifest": manifest}
+        if summary:
+            body["final_summary"] = summary.read_text(errors="replace")[-20000:]
+        r = self.client.post(f"{self.base}/v1/runs/{self.run_id}/complete", json=body, headers=self.headers)
+        r.raise_for_status()
+        logger.info(f"Run {self.run_id} complete: {len(manifest)} file(s); state {r.json().get('state')}")
+        return r.json()
+
+    def upload_status(self) -> dict:
+        r = self.client.get(f"{self.base}/v1/runs/{self.run_id}/upload", headers=self.headers)
+        r.raise_for_status()
+        return r.json()
+
+    def run(self, once: bool = False, poll_s: float = 5.0, status_s: float = 60.0,
+            hint_after_s: float = 600.0) -> dict:
+        """Upload until the folder is done: with ``once``, everything there
+        now; otherwise until MinKNOW's final summary appears and every file
+        is uploaded, or the run is completed another way (the run page's
+        button), which the uploader notices within ``status_s``. After
+        ``hint_after_s`` with every file up and nothing new (MinKNOW writes
+        a file every few minutes while sequencing), it says how to finish."""
+        told_waiting = False
+        idle_since = time.monotonic()
+        last_status = time.monotonic()
+        while True:
+            for p in self.pending():
+                if once or self.stable(p):
+                    try:
+                        self.upload(p)
+                    except httpx.HTTPStatusError as e:
+                        if e.response.status_code == 409:
+                            status = self.upload_status()
+                            if not status.get("open"):
+                                logger.warning(f"Run {self.run_id} stopped taking uploads (state "
+                                               f"{status.get('state')}) before {p.name} was uploaded")
+                                return status
+                        if 400 <= e.response.status_code < 500:
+                            raise  # a bad job code or a closed run: no retry will fix it
+                        logger.warning(f"Upload of {p.name} failed ({e}); will retry")
+                    except httpx.HTTPError as e:
+                        logger.warning(f"Upload of {p.name} failed ({e}); will retry")
+            if once or (self.final_summary() is not None and not self.pending()):
+                if not self.done:
+                    raise SystemExit("Nothing to upload: no FASTQ or POD5 files in the folder")
+                return self.complete()
+            if self.done and not self.pending():
+                if not told_waiting and time.monotonic() - idle_since >= hint_after_s:
+                    logger.info(
+                        f"All {len(self.done)} file(s) uploaded; waiting for MinKNOW's final_summary. "
+                        "If sequencing is finished, press Ctrl+C and run again with --once "
+                        "(nothing is uploaded twice), or click 'Upload is complete' on the run page.")
+                    told_waiting = True
+            else:
+                told_waiting = False
+                idle_since = time.monotonic()
+            if time.monotonic() - last_status >= status_s:
+                last_status = time.monotonic()
+                try:
+                    status = self.upload_status()
+                except httpx.HTTPError as e:
+                    logger.warning(f"Could not check the run's state ({e}); will retry")
+                else:
+                    if not status.get("open"):
+                        logger.info(f"Run {self.run_id} is no longer taking uploads "
+                                    f"(state {status.get('state')}); nothing left to do")
+                        return status
+            time.sleep(poll_s)
+
+
+def run(argv: Optional[list[str]] = None) -> int:
+    ap = argparse.ArgumentParser(prog="specimux-cloud upload", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("folder", type=Path, help="The run folder (MinKNOW output, or a folder of FASTQ)")
+    ap.add_argument("--job-code", required=True, help="From the job page: <run id>.<secret>")
+    ap.add_argument("--run-api", required=True, help="The run API base URL")
+    ap.add_argument("--once", action="store_true",
+                    help="Upload what is there now and complete, instead of watching for the final summary")
+    ap.add_argument("--settle", type=float, default=30.0, help="Seconds a file must be unchanged (default 30)")
+    ap.add_argument("--include-failed", action="store_true",
+                    help="Also upload reads under MinKNOW's fastq_fail / pod5_fail folders")
+    ap.add_argument("--log-level", default="INFO")
+    args = ap.parse_args(argv)
+    logging.basicConfig(level=getattr(logging, args.log_level.upper()),
+                        format="%(asctime)s %(levelname)-8s %(message)s", datefmt="%H:%M:%S")
+    if logging.getLogger().level > logging.DEBUG:
+        # httpx logs every request line, and a presigned URL carries a session token
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+    if not args.folder.is_dir():
+        ap.error(f"{args.folder} is not a directory")
+    up = Uploader(args.run_api, args.job_code, args.folder, settle_s=args.settle,
+                  include_failed=args.include_failed)
+    try:
+        up.run(once=args.once)
+    except httpx.HTTPStatusError as e:
+        logger.error(f"{e.request.method} {e.request.url}: {e.response.status_code} {e.response.text[:300]}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(run())

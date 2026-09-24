@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""Stand-in dorado: the "POD5" is a text file of FASTQ records, emitted as
+the calls; a progress line goes to stderr like the real one. FAKE_DORADO_FAIL
+makes it exit 1 (a GPU that never came up); FAKE_DORADO_SLEEP=<s> makes it
+take that long (a job to stop)."""
+import os, sys, time
+args = sys.argv[1:]
+assert args[0] == "basecaller" and "--emit-fastq" in args and "--no-trim" in args, args
+model, path = args[1], args[2]
+if os.environ.get("FAKE_DORADO_FAIL"):
+    sys.stderr.write("[error] no CUDA device\n"); sys.exit(1)
+if os.environ.get("FAKE_DORADO_SLEEP"):
+    time.sleep(float(os.environ["FAKE_DORADO_SLEEP"]))
+data = open(path, "rb").read()
+sys.stderr.write(f"[info] Basecalling {path} with {model}\n[info] > Simplex reads basecalled: {data.count(b'@')}\n")
+sys.stdout.buffer.write(data)

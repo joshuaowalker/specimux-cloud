@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""Stand-in vsearch: builds a 'udb' by copying, and matches every query to the first reference at 99%."""
+import sys
+from pathlib import Path
+args = sys.argv[1:]
+if "--makeudb_usearch" in args:
+    ref = Path(args[args.index("--makeudb_usearch") + 1]); out = Path(args[args.index("--output") + 1])
+    out.write_bytes(ref.read_bytes())
+    sys.exit(0)
+query = Path(args[args.index("--usearch_global") + 1])
+db = Path(args[args.index("--db") + 1])
+target = next(l[1:].split()[0] for l in db.read_text().splitlines() if l.startswith(">"))
+for line in query.read_text().splitlines():
+    if line.startswith(">"):
+        q = line[1:].split()[0]
+        print(f"{q}\t{target}\t99.0\t10\t100.0")

@@ -1,0 +1,28 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.idea/
+.obsidian/
+.playwright-mcp/
+.coverage
+# local development data
+data/
+infra/cdk.out/
+infra/node_modules/
+infra/cdk-outputs.json
+infra/cdk.context.json
+# third-party reference material (e.g. the published basecalling protocol PDF): kept locally, not redistributed
+docs/reference/
+# credentials and local environment: never committed
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+.aws/

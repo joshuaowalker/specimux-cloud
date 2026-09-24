@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""Stand-in speconsense-summarize: one variant file per specimen; aggregate writes summary.fasta."""
+import json, sys
+from pathlib import Path
+args = sys.argv[1:]
+summary = Path(args[args.index("--summary-dir") + 1]); summary.mkdir(parents=True, exist_ok=True)
+source = Path(args[args.index("--source") + 1])
+if "--aggregate-only" in args:
+    seqs = sorted(p for p in summary.glob("*-RiC*.fasta"))
+    summary.joinpath("summary.fasta").write_text("".join(p.read_text() for p in seqs))
+    sys.exit(0)
+sid = args[args.index("--specimen") + 1]
+ric = (source / f"{sid}-all.fasta").read_text().split("ric=")[1].split()[0]
+(summary / f"{sid}-1.v1-RiC{ric}.fasta").write_text(f">{sid}-1.v1\nACGTACGTAC\n")
+print(json.dumps({"specimen_id": sid, "variant_count": 1,
+                  "variants": [{"name": f"{sid}-1.v1", "ric": int(ric), "size": int(ric), "length": 10}]}))
