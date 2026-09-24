@@ -271,9 +271,9 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
 <fieldset><legend>Basecalling (POD5 input only)</legend>
 <label for="model">Dorado model</label><select id="model" name="model">{models}</select>
 <label for="min_length">Read length window</label>
-<span class="inline"><input type="number" id="min_length" name="min_length" value="{esc(bc.get("min_length", 400))}" min="0" style="width:7em"> to
-<input type="number" id="max_length" name="max_length" value="{esc(bc.get("max_length", 2000))}" min="0" style="width:7em"> bases</span>
-<span class="muted">400 to 2000 for the full ITS amplicon; 100 to 700 for ITS2 alone.</span>
+<span class="inline"><input type="number" id="min_length" name="min_length" value="{esc(bc.get("min_length", 100))}" min="0" style="width:7em"> to
+<input type="number" id="max_length" name="max_length" value="{esc(bc.get("max_length", 3000))}" min="0" style="width:7em"> bases</span>
+<span class="muted">The default keeps every plausible amplicon; the published protocol narrows it to 400 to 2000 for the full ITS, 100 to 700 for ITS2 alone.</span>
 <label for="min_qscore">Minimum read qscore (optional)</label><input type="number" id="min_qscore" name="min_qscore" step="0.1" min="0" style="width:7em">
 </fieldset>
 <label for="user_id">Submitted by</label><input type="text" id="user_id" name="user_id" value="{esc(user["label"])}">

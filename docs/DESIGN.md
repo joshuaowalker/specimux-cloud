@@ -285,8 +285,11 @@ costs more in instance hours. The fast model is rejected for a different
 reason: it changes the data (more reads failing primer and barcode
 matching, noisier clusters) against every baseline the suite has been
 validated on. The default follows the published protocol:
-`dorado basecaller sup@v5.0.0 --no-trim`, then a 400–2000 base length
-window for the full ITS amplicon, no qscore floor. The model must be one
+`dorado basecaller sup@v5.0.0 --no-trim`, no qscore floor, then a length
+window. The protocol's is 400–2000 for the full ITS; the default is
+100–3000 instead, wide enough that a default never loses good reads
+systematically (3000 holds any ITS amplicon with primers and indexes, 100
+barely a pair of primers and indexes), and a run may narrow it. The model must be one
 the dorado image bakes (`SPECIMUX_DORADO_MODELS` in the stack, kept in
 step with `docker/dorado.Dockerfile`), so no model downloads at run time.
 Dorado runs without barcode-kit options; specimux demultiplexes.

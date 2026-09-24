@@ -121,8 +121,9 @@ chat and git repositories.
    - **Live** FASTQ, processed as it arrives (see
      [While sequencing](#while-sequencing));
    - **POD5**, basecalled by the service. The defaults are dorado's
-     `sup@v5.0.0` model and reads 400–2000 bases long, the full ITS
-     amplicon.
+     `sup@v5.0.0` model and reads 100–3000 bases long, wide enough
+     that no plausible ITS amplicon is lost (narrow it per run if you
+     like).
 3. The console shows the job code once, with the upload command to run
    where the reads are.
 4. The run page follows the run from there: stage, basecalling
@@ -359,15 +360,18 @@ only its exit report.
 
 A run created with `"input": "pod5"` is basecalled by the service before
 the engine runs. Its spec carries a `basecall` object, defaults filled in
-from the published protocol:
+from the published protocol except for the length window:
 
 ```json
-{"model": "sup@v5.0.0", "min_length": 400, "max_length": 2000, "min_qscore": null}
+{"model": "sup@v5.0.0", "min_length": 100, "max_length": 3000, "min_qscore": null}
 ```
 
 `model` is a dorado model complex from `GET /v1/options` (`dorado_models`,
-the ones the dorado image bakes); the length window keeps the full ITS
-amplicon (100 to 700 for ITS2 alone); `min_qscore` is dorado's own floor,
+the ones the dorado image bakes); the default length window is wide on
+purpose, so a default never loses good reads: 3000 holds any ITS amplicon
+with its primers and indexes, 100 barely a pair of primers and indexes
+(the protocol's 400–2000 for the full ITS, or 100–700 for ITS2 alone, are
+a spec away); `min_qscore` is dorado's own floor,
 off by default. On `complete` the run enters `basecalling`: the dorado
 job (`specimux-cloud dorado`, `dorado basecaller <model> <file>
 --emit-fastq --no-trim`) takes each POD5 file of the manifest, writes the

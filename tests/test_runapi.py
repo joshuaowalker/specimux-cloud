@@ -602,8 +602,8 @@ def test_pod5_run_settings_are_validated_and_recorded(api):
     client, service, launcher = api
     r = _create_pod5(client)
     assert r.status_code == 200, r.text
-    # defaults filled in: the protocol's sup, --no-trim, 400-2000, no qscore floor
-    assert r.json()["spec"]["basecall"] == {"model": "sup@v5.0.0", "min_length": 400, "max_length": 2000,
+    # defaults filled in: the protocol's sup, --no-trim, a wide 100-3000, no qscore floor
+    assert r.json()["spec"]["basecall"] == {"model": "sup@v5.0.0", "min_length": 100, "max_length": 3000,
                                             "min_qscore": None}
     r = _create_pod5(client, {"model": "hac@v6.0.0", "min_length": 100, "max_length": 700, "min_qscore": 9})
     assert r.json()["spec"]["basecall"] == {"model": "hac@v6.0.0", "min_length": 100, "max_length": 700,
@@ -617,7 +617,8 @@ def test_pod5_run_settings_are_validated_and_recorded(api):
     assert client.post("/v1/runs", data=data, files=POD5_FILES, headers={"X-Service-Key": KEY}).status_code == 400
     opts = client.get("/v1/options", headers={"X-Service-Key": KEY}).json()
     assert opts["dorado_models"] == ["sup@v5.0.0", "sup@v5.2.0", "hac@v6.0.0"]
-    assert opts["basecall_defaults"]["min_length"] == 400
+    assert (opts["basecall_defaults"]["min_length"], opts["basecall_defaults"]["max_length"]) == (100, 3000)
+    assert "references" not in opts
 
 
 def _upload_pod5(client, run, names):

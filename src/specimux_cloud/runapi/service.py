@@ -122,12 +122,14 @@ REFERENCE_SHA256 = re.compile(r"[0-9a-f]{64}")
 USER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}")
 
 # Basecalling defaults (docs/DESIGN.md "Basecalling stage"): the published
-# protocol's `dorado basecaller sup --no-trim` followed by a length window
-# for the full ITS amplicon (ITS2-only runs use 100-700), no qscore
-# filter. The model is a dorado model complex; the images bake the
+# protocol's `dorado basecaller sup --no-trim` followed by a length window,
+# no qscore filter. The window is deliberately wide, so a default never
+# loses good reads: 3000 holds any ITS amplicon with its primers and
+# indexes, 100 barely holds a pair of primers and indexes. A lab narrows
+# it per run (the protocol's 400-2000 for full ITS, 100-700 for ITS2). The model is a dorado model complex; the images bake the
 # listed ones so no download happens at run time.
 DEFAULT_DORADO_MODELS = ["sup@v5.0.0", "sup@v5.2.0", "hac@v6.0.0"]
-DEFAULT_BASECALL = {"model": "sup@v5.0.0", "min_length": 400, "max_length": 2000, "min_qscore": None}
+DEFAULT_BASECALL = {"model": "sup@v5.0.0", "min_length": 100, "max_length": 3000, "min_qscore": None}
 
 COMMANDS = ("watch", "unwatch", "correct", "dismiss", "rescan", "finalize", "abort")
 
@@ -597,12 +599,7 @@ class RunService:
 
     def options(self) -> dict:
         from specimux_suite.profiles import list_profiles
-        refs = []
-        try:
-            refs = json.loads(self.storage.get("references/index.json")).get("references", [])
-        except Exception:
-            pass
-        return {"profiles": list_profiles(), "references": refs,
+        return {"profiles": list_profiles(),
                 "modes": ["batch", "live"], "inputs": ["fastq", "pod5"],
                 "dorado_models": list(self.config.dorado_models), "basecall_defaults": dict(DEFAULT_BASECALL),
                 "versions": {"suite": suite_version, "cloud": cloud_version}}
