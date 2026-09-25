@@ -96,3 +96,11 @@ def test_batch_staging_decompresses_gzipped_reads(tmp_path, monkeypatch):
     wrapper.stage_inputs(bundle, work)
     assert (work / "reads.fastq").read_bytes() == b"@a\nACGT\n+\nIIII\n@b\nTTTT\n+\nIIII\n"
     assert not (work / "downloads").exists()
+
+
+def test_the_logged_engine_command_carries_no_job_secret():
+    from specimux_cloud.engine.wrapper import redact_secret
+    cmd = ["specimux-suite", "batch", "--plugin-opt", "job_secret=s3cr3t-value", "--plugin-opt", "generation=3"]
+    shown = " ".join(redact_secret(cmd, "s3cr3t-value"))
+    assert "s3cr3t-value" not in shown and "job_secret=***" in shown and "generation=3" in shown
+    assert redact_secret(cmd, "") == cmd

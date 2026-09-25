@@ -191,6 +191,11 @@ def engine_exit_record(work_dir: Path, generation: int) -> Optional[dict]:
     return rec if rec.get("generation") == generation else None
 
 
+def redact_secret(cmd: list[str], secret: str) -> list[str]:
+    """The command with the job secret masked, for logging."""
+    return [c.replace(secret, "***") if secret else c for c in cmd]
+
+
 def build_engine_command(bundle: dict, work_dir: Path, scratch: Path, run_id: str, run_api: str,
                          job_secret: str, generation: int, extra_args: list[str]) -> list[str]:
     spec = bundle.get("spec") or {}
@@ -395,7 +400,8 @@ def run(argv: Optional[list[str]] = None) -> int:
         live = (bundle.get("spec") or {}).get("mode", "batch") == "live"
         cmd = build_engine_command(bundle, work_dir, scratch, args.run_id, args.run_api, args.job_secret,
                                    args.generation, args.engine_arg)
-        logger.info("Starting engine: " + " ".join(cmd))
+        # (never the job secret: the log goes to CloudWatch)
+        logger.info("Starting engine: " + " ".join(redact_secret(cmd, args.job_secret)))
         engine_log = work_dir / "engine.log"
         with open(engine_log, "ab") as log:
             proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
