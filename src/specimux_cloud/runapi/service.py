@@ -926,7 +926,8 @@ class RunService:
             return v
         name = str(report.get("file") or "")[:255]
         progress = {"file": name, "sent": num("sent"), "size": num("size"), "rate": num("rate"),
-                    "files_done": num("files_done"), "bytes_done": num("bytes_done"), "at": time.time()}
+                    "files_done": num("files_done"), "bytes_done": num("bytes_done"),
+                    "files_total": num("files_total"), "bytes_total": num("bytes_total"), "at": time.time()}
 
         def touch(cur: dict) -> dict:
             if not self.uploads_open(cur):
@@ -1203,11 +1204,13 @@ class RunService:
         progress = dict(run.get("basecalling") or {})
         files = [f for f in progress.get("files", []) if f["name"] != name]
         files.append({"name": name, "key": key, "size": info.size, "etag": info.etag,
-                      "reads_in": int(reads_in), "reads_out": int(reads_out), "done": time.time()})
+                      "reads_in": int(reads_in), "reads_out": int(reads_out), "done": time.time(),
+                      "generation": int(generation)})
         progress.update({"files": files, "done": len(files), "total": len(expected),
                          "reads_in": sum(f["reads_in"] for f in files),
                          "reads_out": sum(f["reads_out"] for f in files)})
-        self.store.update_run(run_id, {"basecalling": progress, "basecall_current": None})
+        self.store.update_run(run_id, {"basecalling": progress, "basecall_current": None,
+                                       **self._basecall_attempt(run, generation)})
         return {"done": progress["done"], "total": progress["total"]}
 
     def record_basecall_progress(self, run_id: str, generation: int, name: str, reads: int,
@@ -1221,8 +1224,18 @@ class RunService:
         if not isinstance(reads, int) or not isinstance(estimate, int) or reads < 0 or estimate < 0:
             raise ServiceError(400, "reads and estimate must be non-negative integers")
         self.store.update_run(run_id, {"basecall_current": {"file": str(name)[:255], "reads": reads,
-                                                            "estimate": estimate, "at": time.time()}})
+                                                            "estimate": estimate, "at": time.time()},
+                                       **self._basecall_attempt(run, generation)})
         return {"ok": True}
+
+    @staticmethod
+    def _basecall_attempt(run: dict, generation: int) -> dict:
+        """When this dorado attempt first reported (the clock for its rate,
+        progress.py): set on its first report, so a retry's clock starts
+        with the retry and not while its machine was starting."""
+        if (run.get("basecall_attempt") or {}).get("generation") == int(generation):
+            return {}
+        return {"basecall_attempt": {"generation": int(generation), "started": time.time()}}
 
     def ingest(self, run_id: str, generation: int, events: list[dict]) -> dict:
         run = self.check_stage_generation(run_id, ENGINE_STAGE, generation)

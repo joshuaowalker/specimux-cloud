@@ -31,47 +31,12 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.datastructures import UploadFile
 
+from ..progress import basecall_text, upload_text
+
 logger = logging.getLogger(__name__)
 
 COOKIE = "specimux_console"
 SESSION_TTL_S = 12 * 3600
-
-
-def _size(n) -> str:
-    """Bytes for people: 2.1 GB, 950 MB."""
-    n = float(n or 0)
-    for unit in ("bytes", "KB", "MB", "GB", "TB"):
-        if n < 1000 or unit == "TB":
-            return f"{n:,.0f} {unit}" if unit == "bytes" else f"{n:,.1f} {unit}"
-        n /= 1000
-
-
-def upload_text(up: dict, now: Optional[float] = None) -> str:
-    """The run page's upload line: whole files received, and the file in
-    flight from the uploader's last report while it is recent."""
-    now = time.time() if now is None else now
-    text = f"{up.get('files', 0)} file(s) received ({_size(up.get('bytes'))})"
-    pr = up.get("progress") or {}
-    size, sent = pr.get("size") or 0, pr.get("sent") or 0
-    if pr.get("file") and size and sent < size and now - float(pr.get("at") or 0) < 60:
-        text += f" · sending {pr['file']}: {100 * sent / size:.0f}% of {_size(size)}"
-        rate = pr.get("rate") or 0
-        if rate > 0:
-            left = (size - sent) / rate
-            text += f" at {_size(rate)}/s, about {max(1, round(left / 60))} min left"
-    return text
-
-
-def basecall_current_text(cur: dict, now: Optional[float] = None) -> str:
-    """The file being basecalled, from the dorado job's last report while it
-    is recent: about how far along (the file's reads are estimated from its
-    size, so never past 99%) and the reads called so far."""
-    now = time.time() if now is None else now
-    if not cur.get("file") or now - float(cur.get("at") or 0) > 120:
-        return ""
-    reads, estimate = cur.get("reads") or 0, cur.get("estimate") or 0
-    pct = f"about {min(99, round(100 * reads / estimate))}%, " if estimate else ""
-    return f"{cur['file']}: {pct}{reads:,} reads called"
 
 
 def _fernet(secret: str):
@@ -403,18 +368,10 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
             rows.append(("Upload", esc(upload_text(run["upload"]))))
         if run.get("manifest"):
             rows.append(("Input", f"{len(run['manifest'])} file(s), {sum(m.get('size', 0) for m in run['manifest']):,} bytes"))
-        if run.get("basecalling"):
-            bc = run["basecalling"]
-            done, total = bc.get("done", 0), bc.get("total", 0)
-            text = f"{done} of {total} file(s)" + (" done" if bc.get("finished") else "")
-            if bc.get("reads_in"):
-                text += f" · {bc['reads_in']:,} reads called, {bc.get('reads_out', 0):,} within the length window"
-            current = basecall_current_text(run.get("basecall_current") or {}) if state == "basecalling" else ""
-            if current:
-                text += f" · now {current}"
-            rows.append(("Basecalling", esc(text)))
-        elif state == "basecalling" and run.get("basecall_current"):
-            rows.append(("Basecalling", esc("now " + basecall_current_text(run["basecall_current"]))))
+        if run.get("basecalling") or state == "basecalling":
+            text = basecall_text(run)
+            if text:
+                rows.append(("Basecalling", esc(text)))
         if run.get("effective_config"):
             rows.append(("Effective configuration", f"<code>{esc(json.dumps(run['effective_config']))}</code>"))
         if run.get("exit"):

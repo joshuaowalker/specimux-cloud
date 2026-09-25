@@ -221,9 +221,12 @@ def test_a_pod5_run_from_the_form(stack):
     assert r.status_code == 303 and "error=" in r.headers["location"]
     # the run page shows basecalling progress once the job is on
     service.store.update_run(rid, {"state": "basecalling", "generation": 1,
-                                   "basecalling": {"done": 1, "total": 3, "reads_in": 4000, "reads_out": 3500}})
+                                   "manifest": [{"key": f"x/pod5/{n}.pod5", "size": 1000} for n in "abc"],
+                                   "basecalling": {"done": 1, "total": 3, "reads_in": 4000, "reads_out": 3500,
+                                                   "files": [{"name": "a.fastq", "reads_in": 4000,
+                                                              "reads_out": 3500}]}})
     page = client.get(f"/console/runs/{rid}").text
-    assert "basecalling on the GPU" in page and "1 of 3 file(s)" in page and "4,000 reads called, 3,500" in page
+    assert "basecalling on the GPU" in page and "about 33% · 4,000 reads called so far (1 of 3 file(s) done)" in page
     assert 'http-equiv="refresh"' in page and "Delete run" not in page
 
 

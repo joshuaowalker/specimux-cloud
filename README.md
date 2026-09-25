@@ -49,7 +49,7 @@ The folder can be a MinKNOW run folder or any folder of `.pod5` or
 what is there and tells the service the upload is complete, and
 processing starts. While a file is sent the uploader prints its progress
 every ten seconds (percentage, speed, time left), and the run page shows
-the files received and the file in flight. The run's type (POD5 or FASTQ) was chosen when the run
+how far the whole upload is and about how long is left. The run's type (POD5 or FASTQ) was chosen when the run
 was created, so upload the matching files.
 
 ### While sequencing
@@ -386,7 +386,9 @@ job (`specimux-cloud dorado`, `dorado basecaller <model> <file>
 reads inside the window to `runs/<user>/<run>/fastq/<name>.fastq` and
 reports it; when the job exits with every file present the engine
 launches over those FASTQs. Progress (`basecalling`: files done, reads
-called and kept) is on the run record and the console's run page.
+called and kept; `basecall_current`: the file in flight) is on the run
+record, and the console's run page turns it into the whole job's
+percentage and time left (`progress.py`).
 
 ### Hosts, keys and dashboard sessions
 

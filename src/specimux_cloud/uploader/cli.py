@@ -193,8 +193,15 @@ class Uploader:
         fails for it, and a run API without the route is asked no more."""
         if not self.reports:
             return
+        done = sum(r.get("size", 0) for r in self.done.values())
+        try:
+            pending = [p.stat().st_size for p in self.pending()]   # the file in flight among them
+        except OSError:
+            pending = []
+        # the whole upload so far: what is up plus what the folder still holds
         body = {"file": name, "sent": sent, "size": size, "rate": round(rate, 1),
-                "files_done": len(self.done), "bytes_done": sum(r.get("size", 0) for r in self.done.values())}
+                "files_done": len(self.done), "bytes_done": done,
+                "files_total": len(self.done) + len(pending), "bytes_total": done + sum(pending)}
         try:
             r = self.report_client.post(f"{self.base}/v1/runs/{self.run_id}/upload/progress", json=body,
                                         headers=self.headers)

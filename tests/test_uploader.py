@@ -155,7 +155,7 @@ def test_upload_progress_is_logged_and_shown_on_the_run_page(api, tmp_path, capl
     run API, whose run record carries what has arrived plus that report, and
     the console turns it into the run page's upload line."""
     import logging
-    from specimux_cloud.console.app import upload_text
+    from specimux_cloud.progress import upload_text
     from specimux_cloud.uploader import cli as up_cli
     monkeypatch.setattr(up_cli, "PROGRESS_LOG_S", 0.0)
     monkeypatch.setattr(up_cli, "PROGRESS_REPORT_S", 0.0)
@@ -177,9 +177,13 @@ def test_upload_progress_is_logged_and_shown_on_the_run_page(api, tmp_path, capl
     assert rec["upload"]["files"] == 1 and rec["upload"]["bytes"] == len(data)
     pr = rec["upload"]["progress"]
     assert pr["file"] == "a.fastq" and 0 < pr["sent"] < pr["size"] == len(data)
+    assert (pr["files_total"], pr["bytes_total"]) == (1, len(data))   # the whole upload so far (0.1.2)
     text = upload_text({**rec["upload"], "progress": {**pr, "sent": 2000, "rate": 10.0, "at": time.time()}})
-    assert text.startswith("1 file(s) received (10.0 KB) · sending a.fastq: 20% of 10.0 KB at 10 bytes/s, about 13 min left")
-    assert "min left" in text
+    assert text == "about 20% of 10.0 KB, about 13 min left at 10 bytes/s · 1 of 1 file(s) received, sending a.fastq"
+    # an uploader before 0.1.2 reports only the file in flight
+    old = {k: v for k, v in pr.items() if k not in ("files_total", "bytes_total")}
+    text = upload_text({**rec["upload"], "progress": {**old, "sent": 2000, "rate": 10.0, "at": time.time()}})
+    assert text == "1 file(s) received (10.0 KB) · sending a.fastq: 20% of 10.0 KB at 10 bytes/s, about 13 min left"
     stale = upload_text({**rec["upload"], "progress": {**pr, "at": time.time() - 120}})
     assert stale == "1 file(s) received (10.0 KB)"                  # an old report is not shown
     hdr = {"Authorization": f"JobCode {run['job_code']}"}
