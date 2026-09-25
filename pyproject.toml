@@ -24,7 +24,7 @@ classifiers = [
 keywords = ["bioinformatics", "nanopore", "sequencing", "barcoding", "cloud"]
 dependencies = [
     # The engine, the viewer app factory, the commands facade and the pages
-    "specimux-suite>=0.3.6",
+    "specimux-suite>=0.3.7",
     "fastapi>=0.104",
     "uvicorn>=0.24",
     "sse-starlette>=1.8",

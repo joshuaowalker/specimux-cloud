@@ -38,6 +38,7 @@ from specimux_suite.web.viewer import create_viewer_app
 
 from .. import __version__ as cloud_version
 from ..packages import PACKAGES, SEAL_SKIP_DIRS, build_zip, package_files
+from ..progress import basecall_estimate, basecall_text, upload_estimate, upload_text
 from ..backends.base import CommandQueue, ConflictError, JobSpec, Launcher, Storage, Store
 from . import auth
 from .events import IngestLog
@@ -68,6 +69,8 @@ VIEW_SKIP_DIRS = SEAL_SKIP_DIRS | {"inat_photos"}
 # Zips of a mirror read thousands of small files over EFS, each a round
 # trip (a 7,933-file view.zip took a minute read one at a time)
 MIRROR_ZIP_WORKERS = 16
+# The dashboard banner before the engine starts (dashboard_status)
+STATUS_CACHE_S = 5
 RUN_ID = re.compile(r"r[0-9a-f]{8}")
 # Cleanup (clean_up, its own loop): a finished run's EFS directory outlives
 # it this long (a dashboard open at the end keeps working), and a cancelled
@@ -214,7 +217,7 @@ class RunView:
     kept current from it, and the mounted viewer app."""
 
     def __init__(self, run: dict, output_dir: Path, events_path: Path, runtime: dict,
-                 public_url: Optional[str] = None):
+                 public_url: Optional[str] = None, status=None):
         self.run_id = run["id"]
         self.host_id = run.get("host")
         # each engine generation starts a fresh event log (the wrapper moves
@@ -244,7 +247,7 @@ class RunView:
         self.app = create_viewer_app(
             self.log, self.state, output_dir,
             config_summary=self.config_summary, runtime=runtime,
-            share=self.share, max_clients=MAX_VIEWERS_PER_RUN,
+            share=self.share, status=status, max_clients=MAX_VIEWERS_PER_RUN,
             title=f"specimux-suite run {self.run_id}",
         )
 
@@ -297,6 +300,7 @@ class RunService:
         self._load_cache: Optional[dict] = None
         self._sharing_cache: dict[str, tuple[float, dict]] = {}
         self._upload_cache: dict[str, tuple[float, dict]] = {}
+        self._status_cache: dict[str, tuple[float, Optional[dict]]] = {}
         self.config.work_root.mkdir(parents=True, exist_ok=True)
 
     # --- paths and keys ---
@@ -1568,11 +1572,41 @@ class RunService:
             runtime = {"apiBase": base, "assetBase": base, "pageBase": base,
                        "sessionEndpoint": "/v1/session",
                        "tokenEndpoint": self.authorize_url(run)}
-            built = RunView(run, out, out / "events.jsonl", runtime=runtime, public_url=self.public_url(run))
+            built = RunView(run, out, out / "events.jsonl", runtime=runtime, public_url=self.public_url(run),
+                            status=lambda: self.dashboard_status(run_id))
             with self._views_lock:
                 view = self._views.setdefault(run_id, built)
         view.last_used = time.time()
         return view
+
+    def dashboard_status(self, run_id: str) -> Optional[dict]:
+        """The dashboard's banner while the engine has not started (the
+        suite's viewer ``status``): the upload, the wait, basecalling, as
+        on the run page; None once the engine's events arrive (the page
+        then reloads onto them) and for a finished run. Cached briefly:
+        every open dashboard asks every ten seconds."""
+        now = time.time()
+        with self._views_lock:
+            hit = self._status_cache.get(run_id)
+            view = self._views.get(run_id)
+        if hit and now - hit[0] < STATUS_CACHE_S:
+            return hit[1]
+        run = self.get_run(run_id)
+        state, status = run["state"], None
+        if state in (CREATED, UPLOADING):
+            up = self._upload_received(run)
+            status = {"text": "Uploading: " + upload_text(up, now), "progress": upload_estimate(up, now)["fraction"]}
+        elif state == INPUT_COMPLETE:
+            status = {"text": "Upload complete; waiting for a machine", "progress": None}
+        elif state == BASECALLING:
+            est = basecall_estimate(run, now)
+            status = {"text": "Basecalling: " + (basecall_text(run, now) or "starting"),
+                      "progress": est["fraction"] if est else None}
+        elif state in (RUNNING, FINALIZING) and (view is None or view.log.version == 0):
+            status = {"text": "Starting the pipeline", "progress": None}
+        with self._views_lock:
+            self._status_cache[run_id] = (now, status)
+        return status
 
     def _view_dir(self, run: dict) -> Path:
         out = self.output_dir(run["id"])
@@ -1601,6 +1635,7 @@ class RunService:
         """Forget a run's view and remove its local copy, if it has one."""
         with self._views_lock:
             view = self._views.pop(run_id, None)
+            self._status_cache.pop(run_id, None)
         cache = self.config.data_dir / "views"
         if view is not None and Path(view.output_dir).parent == cache:
             shutil.rmtree(view.output_dir, ignore_errors=True)

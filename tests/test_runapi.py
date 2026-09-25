@@ -202,6 +202,8 @@ def test_full_batch_run_through_the_api(api, captured_events):
     snap = client.get(f"/v1/runs/{rid}/api/state").json()
     assert snap["version"] == len(events) and snap["specimens"]
     assert snap["config_summary"]["min_reads"] == 10          # from pipeline.started
+    service._status_cache.clear()
+    assert "status" not in client.get(f"/v1/runs/{rid}/api/viewers").json()   # the engine's events took over
     page = client.get(f"/v1/runs/{rid}/").text
     assert f'"apiBase": "/v1/runs/{rid}"' in page and f'src="/v1/runs/{rid}/static/derived.js"' in page
     assert f'"tokenEndpoint": "http://testserver/console/authorize?run={rid}"' in page
@@ -683,6 +685,10 @@ def test_pod5_run_is_basecalled_then_run(api):
     assert (cur["file"], cur["reads"], cur["estimate"]) == ("a.pod5", 1200, 4000)
     rec = client.get(f"/v1/runs/{rid}", headers={"X-Service-Key": KEY}).json()
     assert rec["basecall_attempt"]["generation"] == 1                  # the attempt's clock, from its first report
+    # the dashboard's banner says the same (the suite's viewer status)
+    service._status_cache.clear()
+    banner = client.get(f"/v1/runs/{rid}/api/viewers").json()["status"]
+    assert banner["text"].startswith("Basecalling: about") and banner["progress"] == 0.15   # a.pod5 30% of half the bytes
     from specimux_cloud.progress import basecall_text
     assert basecall_text(rec).endswith("· 1,200 reads called so far (0 of 2 file(s) done, 1st in progress)")
     assert client.post(f"/v1/runs/{rid}/basecall-progress", json={"generation": 1, "reads": -1, "estimate": 1},

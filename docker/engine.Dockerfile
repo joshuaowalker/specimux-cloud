@@ -8,7 +8,7 @@
 # git URL (git+https://github.com/joshuaowalker/specimux-suite.git@<ref>)
 # to test an unreleased branch.
 FROM mambaorg/micromamba:2.0-ubuntu22.04
-ARG SUITE_SPEC="specimux-suite==0.3.6"
+ARG SUITE_SPEC="specimux-suite==0.3.7"
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
