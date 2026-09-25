@@ -187,13 +187,14 @@ class FastqCounter:
 
 
 def basecall_file(entry: dict, bundle: dict, scratch: Path, device: str, binary: str, log,
-                  stop: Optional[StopSignal] = None, progress=None) -> tuple[int, int]:
+                  stop: Optional[StopSignal] = None, progress=None, refresh=None) -> tuple[int, int]:
     """One POD5 file: download, basecall, filter, upload. Returns the read
     counts (before and after the length filter). ``progress(reads)`` is
-    called every PROGRESS_S while dorado runs."""
+    called every PROGRESS_S while dorado runs. ``refresh()`` returns a fresh
+    bundle: the upload URL is taken from one just before the upload, since
+    presigned URLs expire (an hour) and a file can take a while."""
     name = entry["name"]
     out_name = (name[:-5] if name.lower().endswith(".pod5") else name) + ".fastq"
-    target = bundle["fastq_uploads"][out_name]
     basecall = bundle.get("basecall") or {}
     pod5 = scratch / name
     raw = scratch / (out_name + ".raw")
@@ -230,7 +231,9 @@ def basecall_file(entry: dict, bundle: dict, scratch: Path, device: str, binary:
                                            int(basecall.get("max_length") or 0))
         logger.info(f"{name}: {reads_in:,} reads called in {time.monotonic() - started:.0f}s, "
                     f"{reads_out:,} within {basecall.get('min_length')}-{basecall.get('max_length')}; uploading")
-        upload(target["url"], filtered)
+        if refresh is not None:
+            bundle = refresh()
+        upload(bundle["fastq_uploads"][out_name]["url"], filtered)
         return reads_in, reads_out
     finally:
         for p in (pod5, raw, filtered):
@@ -275,13 +278,27 @@ def run(argv: Optional[list[str]] = None) -> int:
         logger.info(f"{len(bundle['pod5'])} POD5 files, {len(done)} already basecalled, {len(todo)} to do; "
                     f"model {bundle.get('basecall', {}).get('model')} on {args.device}")
         bytes_per_read = DEFAULT_BYTES_PER_READ
+
+        def refresh() -> dict:
+            """The bundle again, for fresh presigned URLs (they last an hour
+            and the job can run for several); the last one if the run API
+            doesn't answer, which the storage request then judges."""
+            nonlocal bundle
+            try:
+                bundle = api.job_bundle()
+            except Exception as e:
+                logger.warning(f"Could not refresh the job bundle ({e}); using the URLs from before")
+            return bundle
+
         with open(log_path, "ab") as log:
-            for i, entry in enumerate(todo, 1):
+            for i, todo_entry in enumerate(todo, 1):
+                refresh()
+                entry = next((e for e in bundle.get("pod5") or [] if e["name"] == todo_entry["name"]), todo_entry)
                 estimate = max(1, int((entry.get("size") or 0) / bytes_per_read))
                 report = (lambda reads, name=entry["name"], est=estimate:
                           api.report_progress(args.generation, name, reads, est))
                 reads_in, reads_out = basecall_file(entry, bundle, scratch, args.device, args.dorado, log, stop,
-                                                    progress=report)
+                                                    progress=report, refresh=refresh)
                 if reads_in and entry.get("size"):
                     bytes_per_read = entry["size"] / reads_in   # this run's own reads, for the next estimate
                 out_name = (entry["name"][:-5] if entry["name"].lower().endswith(".pod5") else entry["name"]) + ".fastq"

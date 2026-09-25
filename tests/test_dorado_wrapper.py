@@ -82,3 +82,25 @@ def test_basecalling_reports_progress_while_dorado_runs(tmp_path, monkeypatch):
     assert got == (3, 3) and delivered["put-a"] == reads
     assert len(seen) >= 3 and all(n == 0 for n in seen)   # the stand-in writes only at the end
     assert not os.listdir(scratch)                         # scratch cleaned
+
+
+def test_the_upload_uses_a_url_fetched_after_basecalling(tmp_path, monkeypatch):
+    """Presigned URLs last an hour and a basecalling job can run for
+    several (a 23 GB run on one A10G failed its ninth file with 403 when
+    the URLs from the job's start expired): the FASTQ goes up with a URL
+    from a bundle fetched after dorado finished."""
+    from specimux_cloud.dorado import wrapper
+    fake = Path(__file__).parent / "fake_tools" / "dorado"
+    reads = _fastq(500, 600)
+    monkeypatch.setattr(wrapper, "download", lambda url, dest, *a: dest.write_bytes(reads))
+    used = []
+    monkeypatch.setattr(wrapper, "upload", lambda url, path: used.append(url))
+    stale = {"fastq_uploads": {"a.fastq": {"url": "expired", "key": "k"}},
+             "basecall": {"model": "sup@v5.0.0", "min_length": 100, "max_length": 3000}}
+    fresh = {**stale, "fastq_uploads": {"a.fastq": {"url": "fresh", "key": "k"}}}
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    with open(tmp_path / "dorado.log", "ab") as log:
+        wrapper.basecall_file({"name": "a.pod5", "url": "u", "size": 1}, stale, scratch, "cpu", str(fake), log,
+                              refresh=lambda: fresh)
+    assert used == ["fresh"]
