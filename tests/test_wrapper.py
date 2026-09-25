@@ -5,6 +5,8 @@ engine again."""
 import json
 from pathlib import Path
 
+import pytest
+
 from specimux_cloud.engine import wrapper
 
 
@@ -78,6 +80,40 @@ def test_packages_come_from_the_local_output_and_the_mirrored_log(tmp_path):
     assert names["reads.zip"] == ["specimux/full/ITS/S1.fastq"]
 
 
+
+def test_the_three_packages_are_built_and_uploaded_together(tmp_path, monkeypatch):
+    """Each package is a readable zip of its files; one that fails to upload
+    leaves the others recorded (the run API rebuilds the rest at seal)."""
+    import io
+    import zipfile
+    scratch, mirror = tmp_path / "scratch", tmp_path / "mirror"
+    for rel in ("summary/S1-RiC3.fasta", "consensus/S1/S1-all.fasta", "specimux/full/ITS/S1.fastq"):
+        (scratch / "output" / rel).parent.mkdir(parents=True, exist_ok=True)
+        (scratch / "output" / rel).write_text(">x\nACGT\n")
+    mirror.mkdir()
+    (mirror / "events.jsonl").write_text("{}\n")
+
+    class Api:
+        def package_uploads(self, generation):
+            return {n: {"url": n} for n in ("results.zip", "output.zip", "reads.zip")}
+
+    got = {}
+
+    def upload(url, path):
+        if url == fail[0]:
+            raise OSError("storage said no")
+        got[url] = path.read_bytes()
+    monkeypatch.setattr(wrapper, "upload", upload)
+    fail = [None]
+    done = wrapper.package_and_upload(Api(), 1, scratch, mirror)
+    assert set(done) == {"results.zip", "output.zip", "reads.zip"}
+    assert zipfile.ZipFile(io.BytesIO(got["reads.zip"])).namelist() == ["specimux/full/ITS/S1.fastq"]
+    assert zipfile.ZipFile(io.BytesIO(got["results.zip"])).namelist() == ["summary/S1-RiC3.fasta", "events.jsonl"]
+    assert not list(scratch.glob("*.zip"))                        # built on scratch, removed after upload
+    fail[0] = "reads.zip"
+    with pytest.raises(wrapper.PackagingFailed) as e:
+        wrapper.package_and_upload(Api(), 1, scratch, mirror)
+    assert set(e.value.done) == {"results.zip", "output.zip"} and "storage said no" in str(e.value)
 
 def test_batch_staging_decompresses_gzipped_reads(tmp_path, monkeypatch):
     """MinKNOW writes .fastq.gz: batch staging concatenates plain and

@@ -212,6 +212,10 @@ def test_full_batch_run_through_the_api(api, captured_events):
     st = client.get(f"/v1/runs/{rid}", headers={"X-Service-Key": KEY}).json()
     assert st["effective_config"]["min_reads"] == 10
     assert st["ingested_files"]                                 # specimux.completed seen
+    ep = st["engine_progress"]                                   # the run page's engine line
+    assert ep["demux"] is None and ep["matched_reads"] > 0
+    assert ep["summarized"] <= ep["consensus_done"] <= ep["specimens"] and ep["consensus_done"] > 0
+    assert ep["specimens"] == sum(1 for sp in snap["specimens"].values() if sp["total_reads"] >= 10)
 
     # --- a command from the browser, applied by the engine ---
     sid = next(iter(snap["specimens"]))

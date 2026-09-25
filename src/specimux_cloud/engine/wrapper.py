@@ -49,6 +49,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -261,17 +262,42 @@ def package_and_upload(api: "RunApiClient", generation: int, scratch: Path, mirr
     the mirror) and upload them; returns ``{name: {"size": bytes}}``."""
     out = scratch / "output"
     urls = api.package_uploads(generation)
-    done = {}
-    for name, include in PACKAGES.items():
-        if name not in urls:
-            continue
-        files = package_files(out, include, extra={"events.jsonl": mirror / "events.jsonl"})
+
+    def one(name: str) -> dict:
+        started = time.monotonic()
+        files = package_files(out, PACKAGES[name], extra={"events.jsonl": mirror / "events.jsonl"})
         dest = build_zip(scratch / name, files)
         upload(urls[name]["url"], dest)
-        done[name] = {"size": dest.stat().st_size, "files": len(files)}
+        info = {"size": dest.stat().st_size, "files": len(files)}
         dest.unlink(missing_ok=True)
-        logger.info(f"Uploaded {name}: {done[name]['size']:,} bytes, {len(files)} files")
+        logger.info(f"Uploaded {name}: {info['size']:,} bytes, {len(files)} files "
+                    f"in {time.monotonic() - started:.0f} s")
+        return info
+
+    # the three at once: each deflates on every CPU, and the small ones
+    # upload while reads.zip is still compressing
+    names = [n for n in PACKAGES if n in urls]
+    with ThreadPoolExecutor(len(names) or 1) as pool:
+        futures = {n: pool.submit(one, n) for n in names}
+    done, failed = {}, {}
+    for n, fut in futures.items():
+        try:
+            done[n] = fut.result()
+        except Exception as e:
+            logger.error(f"Packaging {n} failed", exc_info=e)
+            failed[n] = e
+    if failed:
+        raise PackagingFailed(done, failed)
     return done
+
+
+class PackagingFailed(Exception):
+    """Some packages failed; ``done`` holds those that were uploaded (the
+    run API builds the rest from the mirror at seal)."""
+
+    def __init__(self, done: dict, failed: dict):
+        super().__init__("; ".join(f"{n}: {e}" for n, e in failed.items()))
+        self.done = done
 
 
 def stage_inputs(bundle: dict, work_dir: Path) -> None:
@@ -422,8 +448,10 @@ def run(argv: Optional[list[str]] = None) -> int:
             except StopRequested:
                 raise
             except Exception as e:
-                # the run API seals from the mirror instead
-                logger.exception("Packaging failed")
+                # the run API builds what is missing from the mirror at seal
+                packages = getattr(e, "done", {})
+                if not isinstance(e, PackagingFailed):
+                    logger.exception("Packaging failed")
                 tail = (tail + f"\nwrapper: packaging failed: {e}")[-4000:]
             write_engine_exit_record(work_dir, args.generation, exit_code, tail, packages)
     except StopRequested as e:

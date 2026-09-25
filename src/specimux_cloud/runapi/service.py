@@ -65,6 +65,9 @@ ACTIVE_STATES = {UPLOADING, INPUT_COMPLETE, BASECALLING, RUNNING, FINALIZING, SE
 # provider's host).
 VIEW_ZIP = "view.zip"
 VIEW_SKIP_DIRS = SEAL_SKIP_DIRS | {"inat_photos"}
+# Zips of a mirror read thousands of small files over EFS, each a round
+# trip (a 7,933-file view.zip took a minute read one at a time)
+MIRROR_ZIP_WORKERS = 16
 RUN_ID = re.compile(r"r[0-9a-f]{8}")
 # Cleanup (clean_up, its own loop): a finished run's EFS directory outlives
 # it this long (a dashboard open at the end keeps working), and a cancelled
@@ -225,9 +228,13 @@ class RunView:
         # The effective configuration arrives with pipeline.started; the
         # viewer holds this dict by reference, so it is filled in place
         self.config_summary: dict = dict(run.get("effective_config") or {})
+        # the demux in flight (its last specimux.progress), for the run page
+        self.demux: Optional[dict] = None
         for ev in self.log.replay():
             self._track_config(ev)
+            self._track_demux(ev)
         self.log.add_listener(self._track_config)
+        self.log.add_listener(self._track_demux)
         # The dashboard draws a QR code from /api/state's "share": the
         # owner's public link while the run is shared (held by reference)
         self.share: dict = {}
@@ -250,6 +257,30 @@ class RunView:
         if event.type == "pipeline.started" and event.data.get("config_summary"):
             self.config_summary.clear()
             self.config_summary.update(event.data["config_summary"])
+
+    def _track_demux(self, event) -> None:
+        if event.type == "specimux.started":
+            self.demux = {"processed": 0, "matched": 0, "total_est": 0}
+        elif event.type == "specimux.progress":
+            self.demux = {k: event.data.get(k) or 0 for k in ("processed", "matched", "total_est")}
+        elif event.type == "specimux.completed":
+            self.demux = None
+
+    def engine_progress(self) -> dict:
+        """Where the engine is, from the events ingested so far: the demux
+        in flight, and how many specimens with enough reads for consensus
+        (the run's min_reads) have been through consensus and summarized."""
+        min_reads = self.config_summary.get("min_reads") or 0
+        specimens = list(self.state.specimens.values())   # a copy: ingest applies events meanwhile
+        eligible = [s for s in specimens if s.total_reads and s.total_reads >= min_reads]
+        past = {"consensus_done", "identified", "no_match", "summarized", "error"}
+        return {"demux": dict(self.demux) if self.demux else None,
+                "demux_finished": self.state.demux_finished,
+                "input_reads": self.state.total_input_reads,
+                "matched_reads": self.state.total_matched_reads,
+                "specimens": len(eligible),
+                "consensus_done": sum(1 for s in eligible if s.status.value in past),
+                "summarized": sum(1 for s in eligible if s.status.value == "summarized")}
 
 
 class RunService:
@@ -466,6 +497,12 @@ class RunService:
         d["public"] = {"enabled": bool(pub.get("enabled")), "allow_starring": pub.get("allow_starring", True),
                        "allow_downloads": bool(pub.get("allow_downloads")), "url": self.public_url(run)}
         d["dashboard_url"] = self.dashboard_url(run["id"])
+        if run["state"] in (RUNNING, FINALIZING):
+            # from the view ingest keeps (never built here just for this)
+            with self._views_lock:
+                view = self._views.get(run["id"])
+            if view is not None and view.generation == engine_generation(run):
+                d["engine_progress"] = view.engine_progress()
         return d
 
     def dashboard_url(self, run_id: str) -> str:
@@ -1473,7 +1510,7 @@ class RunService:
             os.close(fd)
             tmp = Path(name)
             try:
-                build_zip(tmp, package_files(out, include))
+                build_zip(tmp, package_files(out, include), workers=MIRROR_ZIP_WORKERS)
                 yield tmp
             finally:
                 tmp.unlink(missing_ok=True)

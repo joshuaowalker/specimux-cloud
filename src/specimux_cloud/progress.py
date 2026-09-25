@@ -1,7 +1,8 @@
 """Whole-job progress for a run's upload and basecalling, from its run
 record (as ``GET /v1/runs/{id}`` returns it): how far along, how long
 left, and the line the run page shows. Standard library only; the console
-formats its run page with it.
+formats its run page with it. The engine's progress is the run API's
+``engine_progress`` summary of the events it has ingested.
 
 Basecalling progress is measured in POD5 bytes: the files delivered, plus
 the file being called scaled by its reads so far over the dorado job's
@@ -165,3 +166,26 @@ def upload_text(up: dict, now: Optional[float] = None) -> str:
         if est["rate"]:
             text += f" at {size_text(est['rate'])}/s, {time_left_text(est['seconds_left'])}"
     return text
+
+
+def engine_text(run: dict) -> str:
+    """The run page's engine line, from ``engine_progress`` (the run API
+    adds it while the engine runs): the demux in flight, else the reads
+    demultiplexed and the specimens with enough reads through consensus
+    and summarized."""
+    ep = run.get("engine_progress") or {}
+    if not ep:
+        return ""
+    demux = ep.get("demux")
+    if demux:
+        done, total = demux.get("processed") or 0, demux.get("total_est") or 0
+        pct = f"about {min(99, round(100 * done / total))}% · " if total else ""
+        return (f"demultiplexing: {pct}{done:,} reads" + (f" of about {total:,}" if total else "")
+                + f", {demux.get('matched') or 0:,} matched")
+    parts = []
+    if ep.get("input_reads"):
+        parts.append(f"{ep['input_reads']:,} reads demultiplexed, {ep.get('matched_reads') or 0:,} matched")
+    if ep.get("specimens"):
+        parts.append(f"{ep.get('consensus_done', 0):,} of {ep['specimens']:,} specimens with enough reads"
+                     f" through consensus, {ep.get('summarized', 0):,} summarized")
+    return " · ".join(parts) or "starting"

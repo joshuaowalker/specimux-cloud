@@ -31,7 +31,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.datastructures import UploadFile
 
-from ..progress import basecall_text, upload_text
+from ..progress import basecall_text, engine_text, upload_text
 
 logger = logging.getLogger(__name__)
 
@@ -372,6 +372,8 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
             text = basecall_text(run)
             if text:
                 rows.append(("Basecalling", esc(text)))
+        if engine_text(run):
+            rows.append(("Engine", esc(engine_text(run))))
         if run.get("effective_config"):
             rows.append(("Effective configuration", f"<code>{esc(json.dumps(run['effective_config']))}</code>"))
         if run.get("exit"):

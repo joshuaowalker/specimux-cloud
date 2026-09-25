@@ -128,8 +128,10 @@ sent even when the engine dies.
   manifest's files into one FASTQ, decompressing `.fastq.gz`. Live mode is
   under "Live runs".
 - **Exit.** After the engine exits it builds the three downloads
-  (`packages.py`) from local output, uploads them over presigned URLs
-  (`package-uploads`), writes `engine-exit.json` into the run's EFS
+  (`packages.py`) from local output at once, each deflating its members
+  on every CPU (zipfile cannot take a member compressed elsewhere, so
+  `build_zip` writes the container itself, with ZIP64 records as needed),
+  uploads them over presigned URLs (`package-uploads`), writes `engine-exit.json` into the run's EFS
   directory, and reports the exit code, log tail and packages. The exit
   record matters because Batch retries a job whose host died: a retry of
   the same generation that finds the record reports it instead of running

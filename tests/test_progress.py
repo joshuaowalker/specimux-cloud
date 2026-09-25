@@ -1,7 +1,7 @@
 """Whole-job progress lines (progress.py), from run records shaped like the
 run API's."""
 
-from specimux_cloud.progress import basecall_estimate, basecall_text, upload_text
+from specimux_cloud.progress import basecall_estimate, basecall_text, engine_text, upload_text
 
 GB = 1_000_000_000
 NOW = 1_000_000.0
@@ -70,3 +70,16 @@ def test_whole_upload_line():
                        "at": NOW - 5}}
     assert upload_text(up, NOW) == ("about 58% of 6.0 GB, about 1 h 23 min left at 500.0 KB/s"
                                     " · 3 of 6 file(s) received, sending f3.pod5")
+
+
+def test_engine_line():
+    assert engine_text({}) == ""
+    assert engine_text({"engine_progress": {"demux": None, "input_reads": 0}}) == "starting"
+    demux = {"demux": {"processed": 1_000_000, "matched": 800_000, "total_est": 2_600_000}}
+    assert engine_text({"engine_progress": demux}) == \
+        "demultiplexing: about 38% · 1,000,000 reads of about 2,600,000, 800,000 matched"
+    later = {"demux": None, "input_reads": 2_609_990, "matched_reads": 2_100_000,
+             "specimens": 1203, "consensus_done": 812, "summarized": 700}
+    assert engine_text({"engine_progress": later}) == (
+        "2,609,990 reads demultiplexed, 2,100,000 matched · 812 of 1,203 specimens with enough reads"
+        " through consensus, 700 summarized")
