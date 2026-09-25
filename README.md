@@ -164,7 +164,7 @@ downloads `results.zip`:
 
 ```bash
 specimux-cloud submit --run-api https://runs.specimux.com --service-key <key> \
-    --primers primers.fasta --specimens Index.txt [--reference refs.fasta] \
+    --primers primers.fasta --specimens Index.txt [--reference refs.fasta] [--name Run150] \
     --wait <folder or files>
 ```
 

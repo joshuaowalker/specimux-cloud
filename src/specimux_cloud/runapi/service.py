@@ -26,6 +26,7 @@ import shutil
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 import zipfile
 from dataclasses import dataclass, field
@@ -75,6 +76,9 @@ RUN_ID = re.compile(r"r[0-9a-f]{8}")
 # A run's optional name (spec.name: the host's name for it, e.g. "Run150"),
 # which names its downloads
 RUN_NAME_MAX = 100
+# Unicode categories refused in it: control, format (invisible: bidi
+# overrides, zero-width), surrogate, line and paragraph separators
+RUN_NAME_BANNED = {"Cc", "Cf", "Cs", "Zl", "Zp"}
 # Cleanup (clean_up, its own loop): a finished run's EFS directory outlives
 # it this long (a dashboard open at the end keeps working), and a cancelled
 # or abandoned run's upload archive this long (a cancelled run may be
@@ -367,6 +371,11 @@ class RunService:
             name = spec["name"]
             if not isinstance(name, str) or not name.strip() or len(name) > RUN_NAME_MAX:
                 raise ServiceError(400, f"name must be 1-{RUN_NAME_MAX} characters")
+            if any(unicodedata.category(c) in RUN_NAME_BANNED for c in name):
+                # control and invisible formatting characters (a line break,
+                # a right-to-left override) have no place in a name that is
+                # shown back to people by every host
+                raise ServiceError(400, "name must not contain control or formatting characters")
         if spec.get("mode", "batch") not in ("batch", "live"):
             raise ServiceError(400, "mode must be batch or live")
         if spec.get("input", "fastq") not in ("fastq", "pod5"):

@@ -33,6 +33,7 @@ from typing import Optional
 
 import httpx
 
+from ..packages import download_name
 from .cli import Uploader, check_service
 
 logger = logging.getLogger("specimux_cloud.submit")
@@ -54,6 +55,9 @@ def run(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--primers", required=True, type=Path)
     ap.add_argument("--specimens", required=True, type=Path)
     ap.add_argument("--reference", type=Path, default=None)
+    ap.add_argument("--name", default=None,
+                    help="The run's name (up to 100 characters); the downloads are named after it, "
+                         "e.g. Run150 -> Run150_Summary.zip")
     ap.add_argument("--profile", default="default")
     ap.add_argument("--min-reads", type=int, default=10)
     ap.add_argument("--vcpus", type=int, default=None, help="Engine job size (default: the service's)")
@@ -90,6 +94,8 @@ def run(argv: Optional[list[str]] = None) -> int:
         return 2
     spec = {"mode": "live" if args.live else "batch", "input": kind, "profile": args.profile,
             "min_reads": args.min_reads}
+    if args.name:
+        spec["name"] = args.name
     if args.vcpus:
         spec["vcpus"] = args.vcpus
     basecall = {k: v for k, v in (("model", args.model), ("min_length", args.min_length),
@@ -160,7 +166,7 @@ def run(argv: Optional[list[str]] = None) -> int:
         r = c.get(f"{base}/v1/runs/{rid}/results.zip", headers=key, follow_redirects=True)
         r.raise_for_status()
         args.results.mkdir(parents=True, exist_ok=True)
-        out = args.results / f"{rid}-results.zip"
+        out = args.results / download_name(st, "results")   # as the browser saves it: Run150_Summary.zip
         out.write_bytes(r.content)
         print(f"run {rid} {st['state']} (engine exit {st.get('exit', {}).get('code')}); results in {out}")
         return 0 if st["state"] == "sealed" else 1

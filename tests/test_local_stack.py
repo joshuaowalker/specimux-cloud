@@ -277,9 +277,10 @@ def test_submit_sends_a_reference_only_once(stack, tmp_path, caplog):
     with caplog.at_level(logging.INFO):
         assert submit(argv) == 0
         assert "already has" not in caplog.text
-        assert submit(argv) == 0
+        assert submit(argv + ["--name", "Run150"]) == 0
         assert "already has refs.fasta; not sending it" in caplog.text
     runs = sorted(service.store.list_runs(host="dev"), key=lambda r: r["created"])
+    assert [r["spec"].get("name") for r in runs[-2:]] == [None, "Run150"]          # submit --name
     shas = {r["spec"].get("reference_sha256") for r in runs[-2:]}
     assert len(shas) == 1 and None not in shas
     assert all("reference" in service.job_bundle(r["id"])["inputs"] for r in runs[-2:])

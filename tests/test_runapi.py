@@ -1314,3 +1314,9 @@ def test_a_run_name_names_the_downloads(api):
     assert download_name(run, "output") == "Run_150_Missouri_Extras.zip"
     assert download_name({"id": "r1", "spec": {"name": "///"}}, "reads") == "r1_Reads.zip"   # nothing left: the id
     assert create("").status_code == 400 and create("x" * 101).status_code == 400 and create(7).status_code == 400
+    # no control or invisible formatting characters: a line break, a tab, a
+    # right-to-left override, a zero-width space, a line separator
+    for bad in ("Run\n150", "Run\t150", "Run\u202e150", "Run\u200b150", "Run\u2028150"):
+        r = create(bad)
+        assert r.status_code == 400 and "control or formatting" in r.json()["error"], bad
+    assert create("Réunion 2026 — Φ").status_code == 200           # other Unicode is fine
