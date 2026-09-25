@@ -31,6 +31,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.datastructures import UploadFile
 
+from ..packages import DOWNLOAD_LABEL, download_name
 from ..progress import basecall_text, engine_text, upload_text
 
 logger = logging.getLogger(__name__)
@@ -175,9 +176,10 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(run.get("created", 0)))
         state = run.get("state", "")
         spec = run.get("spec") or {}
-        results = (f'<a href="{mount}/runs/{esc(rid)}/results.zip">results.zip</a>'
+        results = (f'<a href="{mount}/runs/{esc(rid)}/results.zip">{esc(download_name(run, "results"))}</a>'
                    if run.get("sealed") and not run["sealed"].get("error") else '<span class="muted">—</span>')
-        return (f'<tr><td><a href="{mount}/runs/{esc(rid)}"><code>{esc(rid)}</code></a></td>'
+        name = f'<br>{esc(spec["name"])}' if spec.get("name") else ""
+        return (f'<tr><td><a href="{mount}/runs/{esc(rid)}"><code>{esc(rid)}</code></a>{name}</td>'
                 f'<td class="state">{esc(state)}<br><span class="muted">{esc(STATE_HELP.get(state, ""))}</span></td>'
                 f'<td>{esc(spec.get("mode", "batch"))} · {esc(spec.get("input", "fastq"))}</td>'
                 f'<td>{esc(run.get("user_id"))}</td><td>{esc(when)}</td>'
@@ -257,6 +259,7 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
         return page("New run", f"""
 <form method="post" action="{mount}/new" enctype="multipart/form-data" class="card">
 <h2>New run</h2>{err}{load_line(load)}
+<label for="name">Run name (optional; names the downloads, e.g. Run150 → Run150_Summary.zip)</label><input type="text" id="name" name="name" maxlength="100">
 <label for="primers">Primers (FASTA)</label><input type="file" id="primers" name="primers" required>
 <label for="specimens">Specimens (Index.txt)</label><input type="file" id="specimens" name="specimens" required>
 <label for="reference">Reference database (FASTA, optional; <code>name="…"</code> headers)</label><input type="file" id="reference" name="reference">
@@ -292,6 +295,8 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
         kind = str(form.get("input") or "fastq")
         mode = "live" if form.get("mode") == "live" else "batch"
         spec = {"mode": mode, "input": kind, "profile": str(form.get("profile") or "default")}
+        if str(form.get("name") or "").strip():
+            spec["name"] = str(form.get("name")).strip()
         try:
             spec["min_reads"] = int(form.get("min_reads") or 10)
             if kind == "pod5":
@@ -360,6 +365,7 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
         if run.get("uploads_open") and state in ("running", "finalizing"):
             help_text += ", receiving files (live)"
         rows = [("State", f'<span class="state">{esc(state)}</span> <span class="muted">{esc(help_text)}</span>'),
+                *([("Name", esc(run["spec"]["name"]))] if (run.get("spec") or {}).get("name") else []),
                 ("Created", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(run.get("created", 0)))),
                 ("Submitted by", esc(run.get("user_id"))),
                 ("Spec", f"<code>{esc(json.dumps(run.get('spec') or {}))}</code>"),
@@ -392,9 +398,10 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
             if se.get("error"):
                 rows.append(("Seal", f'<span class="error">failed: {esc(se["error"])}</span>'))
             else:
-                links = " · ".join(f'<a href="{mount}/runs/{esc(run_id)}/{n}.zip">{n}.zip</a> ({se.get(n + "_bytes", 0):,} bytes)'
-                                   for n in ("results", "output", "reads") if se.get(n))
-                rows.append(("Downloads", links + f' · <a href="{mount}/runs/{esc(run_id)}/events.jsonl">events.jsonl</a>'))
+                links = "<br>".join(f'{DOWNLOAD_LABEL[n]}: <a href="{mount}/runs/{esc(run_id)}/{n}.zip">'
+                                    f'{esc(download_name(run, n))}</a> ({se.get(n + "_bytes", 0):,} bytes)'
+                                    for n in ("results", "output", "reads") if se.get(n))
+                rows.append(("Downloads", links + f'<br>event log: <a href="{mount}/runs/{esc(run_id)}/events.jsonl">events.jsonl</a>'))
         if run.get("pending_commands"):
             rows.append(("Pending commands", esc(len(run["pending_commands"]))))
         rows.append(("Public viewing", public_controls(run_id, run.get("public") or {})))

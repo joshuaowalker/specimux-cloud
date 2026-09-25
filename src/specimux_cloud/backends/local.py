@@ -128,8 +128,10 @@ class DirectoryStorage:
     def presign_put(self, key: str, expires_s: int = 3600) -> str:
         return self._presign("PUT", key, expires_s)
 
-    def presign_get(self, key: str, expires_s: int = 3600) -> str:
-        return self._presign("GET", key, expires_s)
+    def presign_get(self, key: str, expires_s: int = 3600, filename: Optional[str] = None) -> str:
+        url = self._presign("GET", key, expires_s)
+        # the name is not signed: it only names the saved file
+        return url + (f"&{urlencode({'filename': filename})}" if filename else "")
 
     def verify(self, method: str, key: str, exp: str, sig: str) -> bool:
         try:

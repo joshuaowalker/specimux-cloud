@@ -100,9 +100,16 @@ pipeline. The run page shows the stage and progress and links to the
 live **dashboard**. For scale: a full MinION run of about a million reads
 basecalled with dorado's SUP model in about 47 minutes on one GPU, and
 the pipeline then took about 25 minutes. When a run is done its page
-offers three downloads: `results.zip` (the summary package and the run's
-event log), `output.zip` (the full output) and `reads.zip`
-(demultiplexed reads per specimen).
+offers three downloads, named after the run (the optional run name,
+else its id):
+
+- `<name>_Summary.zip` (`results.zip` in the API): the MycoMap summary
+  package, speconsense-summarize's `summary/` folder at the root of the
+  zip, as is;
+- `<name>_Extras.zip` (`output.zip`): the consensus sequences before
+  summarizing, the identification tables, the iNat ID audit and the
+  run's event log;
+- `<name>_Reads.zip` (`reads.zip`): the demultiplexed reads per specimen.
 
 ## Creating runs
 
@@ -116,7 +123,8 @@ chat and git repositories.
 ### In the console
 
 1. Open `<run API>/console/` and log in with your service key.
-2. **New run:** upload the primers FASTA and the specimens file
+2. **New run:** optionally name it (the downloads are named after it,
+   e.g. `Run150_Summary.zip`), upload the primers FASTA and the specimens file
    (Index.txt), optionally a reference FASTA (`name="..."` headers;
    without one there is no identification; references used before are
    offered again), and choose the input:

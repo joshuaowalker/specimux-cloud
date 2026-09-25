@@ -311,9 +311,11 @@ def create_app(service: RunService, console: bool = True) -> FastAPI:
 
     @app.get("/v1/runs/{run_id}/{package}.zip")
     def results(run_id: str, package: str, request: Request):
-        """results.zip (the summary package plus the log), output.zip (the
-        whole output minus scratch and debug) or reads.zip; the owning
-        host with its key, or a browser with a session."""
+        """results.zip (the MycoMap summary package), output.zip (the
+        extras: consensus, identification, the iNat audit, the log) or
+        reads.zip (packages.py); the owning host with its key, or a browser
+        with a session. The download is named after the run
+        (``<name>_Summary.zip``, ...)."""
         host_or_session(run_id, request)
         return RedirectResponse(service.results_url(run_id, package), status_code=302)
 
@@ -495,13 +497,13 @@ def create_app(service: RunService, console: bool = True) -> FastAPI:
             return Response(status_code=200, headers={"ETag": f'"{info.etag}"'})
 
         @app.get("/v1/storage/{key:path}")
-        async def storage_get(key: str, exp: str = "", sig: str = ""):
+        async def storage_get(key: str, exp: str = "", sig: str = "", filename: str = ""):
             if not storage.verify("GET", key, exp, sig):
                 raise HTTPException(403, "Bad or expired signature")
             path = storage._path(key)
             if not path.is_file():
                 raise HTTPException(404, "No such object")
-            return FileResponse(path)
+            return FileResponse(path, filename=filename or None)
 
     app.mount("/v1/runs", RunViewerDispatcher(service, viewer_allowed))
 

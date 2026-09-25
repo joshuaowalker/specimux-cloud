@@ -278,7 +278,10 @@ def test_full_batch_run_through_the_api(api, captured_events):
     r = client.get(f"/v1/runs/{rid}/results.zip", headers={"X-Service-Key": KEY}, follow_redirects=True)
     assert r.status_code == 200
     names = zipfile.ZipFile(io.BytesIO(r.content)).namelist()
-    assert names == ["events.jsonl", "summary/summary.fasta"]
+    assert names == ["summary.fasta"]                     # the MycoMap package: summary/ at the root, as is
+    cd = client.get(f"/v1/runs/{rid}/results.zip", headers={"X-Service-Key": KEY},
+                    follow_redirects=False).headers["location"]
+    assert f"filename={rid}_Summary.zip" in cd              # no run name: named after the id
     # the same download from the dashboard, with the session cookie only
     r = client.get(f"/v1/runs/{rid}/results.zip", follow_redirects=False)
     assert r.status_code == 302 and "sig=" in r.headers["location"]
@@ -289,6 +292,7 @@ def test_full_batch_run_through_the_api(api, captured_events):
     r = client.get(f"/v1/runs/{rid}/output.zip", headers={"X-Service-Key": KEY}, follow_redirects=True)
     names = zipfile.ZipFile(io.BytesIO(r.content)).namelist()
     assert "consensus/S1/S1-all.fasta" in names and not any("cluster_debug" in n for n in names)
+    assert "events.jsonl" in names and not any(n.startswith("summary") for n in names)   # the extras
     assert client.get(f"/v1/runs/{rid}/reads.zip", headers={"X-Service-Key": KEY}, follow_redirects=True).status_code == 200
     assert client.get(f"/v1/runs/{rid}/other.zip", headers={"X-Service-Key": KEY}).status_code == 404
     sealed = service.get_run(rid)["sealed"]
@@ -1288,3 +1292,25 @@ def test_every_refusal_carries_error_and_the_older_detail(api):
     assert r.status_code == 403 and r.json()["error"] == r.json()["detail"] == "Job code required"
     r = client.get(f"/v1/runs/{run['id']}", headers={"X-Service-Key": "nope"})
     assert r.status_code in (401, 403) and r.json()["error"]
+
+
+def test_a_run_name_names_the_downloads(api):
+    """spec.name (optional, the host's name for the run) names the
+    downloads: Run150_Summary.zip, reduced to filename-safe characters."""
+    from specimux_cloud.packages import download_name
+    client, service, _ = api
+    files = {"primers": ("primers.fasta", b">ITS1F\nCTTGGTCATTTAGAGGAAGTAA\n"),
+             "specimens": ("Index.txt", b"SampleID\tPrimerPool\nS1\tITS\n")}
+
+    def create(name):
+        spec = {"mode": "batch", "input": "fastq", "profile": "default", "name": name}
+        return client.post("/v1/runs", data={"spec": json.dumps(spec), "user_id": "u42"}, files=files,
+                           headers={"X-Service-Key": KEY})
+    r = create("  Run 150 / Missouri  ")
+    assert r.status_code == 200, r.text
+    run = service.get_run(r.json()["id"])
+    assert run["spec"]["name"] == "Run 150 / Missouri"
+    assert download_name(run, "results") == "Run_150_Missouri_Summary.zip"
+    assert download_name(run, "output") == "Run_150_Missouri_Extras.zip"
+    assert download_name({"id": "r1", "spec": {"name": "///"}}, "reads") == "r1_Reads.zip"   # nothing left: the id
+    assert create("").status_code == 400 and create("x" * 101).status_code == 400 and create(7).status_code == 400

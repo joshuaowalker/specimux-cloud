@@ -65,7 +65,8 @@ def test_packages_come_from_the_local_output_and_the_mirrored_log(tmp_path):
     out, mirror = tmp_path / "out", tmp_path / "mirror"
     for rel in ("summary/S1-1.v1-RiC3.fasta", "summary/variants/S1-1.v1-RiC3.fasta",
                 "consensus/S1/S1-all.fasta", "consensus/S1/cluster_debug/x.fastq",
-                "specimux/full/ITS/S1.fastq", "snapshots/S1.fastq"):
+                "identification/S1.tsv", "inat_id_suggestions.tsv", "inat_taxon_cache.json",
+                "forward-ack.json", "specimux/full/ITS/S1.fastq", "snapshots/S1.fastq"):
         (out / rel).parent.mkdir(parents=True, exist_ok=True)
         (out / rel).write_text("x")
     (mirror / "inat_photos").mkdir(parents=True)
@@ -74,9 +75,11 @@ def test_packages_come_from_the_local_output_and_the_mirrored_log(tmp_path):
     (mirror / "events.jsonl").write_text("{}\n")
     names = {name: sorted(a for a, _ in package_files(out, inc, extra={"events.jsonl": mirror / "events.jsonl"}))
              for name, inc in PACKAGES.items()}
-    assert names["results.zip"] == ["events.jsonl", "summary/S1-1.v1-RiC3.fasta", "summary/variants/S1-1.v1-RiC3.fasta"]
-    assert names["output.zip"] == ["consensus/S1/S1-all.fasta", "events.jsonl", "summary/S1-1.v1-RiC3.fasta",
-                                   "summary/variants/S1-1.v1-RiC3.fasta"]
+    # results.zip: summary/ as speconsense-summarize wrote it, at the root (the MycoMap package)
+    assert names["results.zip"] == ["S1-1.v1-RiC3.fasta", "variants/S1-1.v1-RiC3.fasta"]
+    # output.zip: the extras, without the caches and the forwarder's bookkeeping
+    assert names["output.zip"] == ["consensus/S1/S1-all.fasta", "events.jsonl", "identification/S1.tsv",
+                                   "inat_id_suggestions.tsv"]
     assert names["reads.zip"] == ["specimux/full/ITS/S1.fastq"]
 
 
@@ -108,7 +111,7 @@ def test_the_three_packages_are_built_and_uploaded_together(tmp_path, monkeypatc
     done = wrapper.package_and_upload(Api(), 1, scratch, mirror)
     assert set(done) == {"results.zip", "output.zip", "reads.zip"}
     assert zipfile.ZipFile(io.BytesIO(got["reads.zip"])).namelist() == ["specimux/full/ITS/S1.fastq"]
-    assert zipfile.ZipFile(io.BytesIO(got["results.zip"])).namelist() == ["summary/S1-RiC3.fasta", "events.jsonl"]
+    assert zipfile.ZipFile(io.BytesIO(got["results.zip"])).namelist() == ["S1-RiC3.fasta"]
     assert not list(scratch.glob("*.zip"))                        # built on scratch, removed after upload
     fail[0] = "reads.zip"
     with pytest.raises(wrapper.PackagingFailed) as e:

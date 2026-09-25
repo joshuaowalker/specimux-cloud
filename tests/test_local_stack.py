@@ -132,7 +132,9 @@ def test_batch_fastq_end_to_end(stack, tmp_path):
     r = httpx.get(f"{base}/v1/runs/{rid}/results.zip", headers=svc, follow_redirects=True)
     assert r.status_code == 200
     names = zipfile.ZipFile(io.BytesIO(r.content)).namelist()
-    assert "summary/summary.fasta" in names and "events.jsonl" in names
+    assert "summary.fasta" in names and not any(n.startswith("summary/") for n in names)   # summary/, flat
+    assert "events.jsonl" not in names
+    assert "Summary.zip" in r.headers.get("content-disposition", "")
     r = httpx.get(f"{base}/v1/runs/{rid}/reads.zip", headers=svc, follow_redirects=True)
     assert any(n.startswith("specimux/") for n in zipfile.ZipFile(io.BytesIO(r.content)).namelist())
     r = httpx.get(f"{base}/v1/runs/{rid}/events.jsonl", headers=svc, follow_redirects=True)

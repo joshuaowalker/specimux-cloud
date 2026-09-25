@@ -37,7 +37,7 @@ from specimux_suite.state import PipelineState
 from specimux_suite.web.viewer import create_viewer_app
 
 from .. import __version__ as cloud_version
-from ..packages import PACKAGES, SEAL_SKIP_DIRS, build_zip, package_files
+from ..packages import DOWNLOAD_SUFFIX, PACKAGES, SEAL_SKIP_DIRS, build_zip, download_name, package_files
 from ..progress import basecall_estimate, basecall_text, upload_estimate, upload_text
 from ..backends.base import CommandQueue, ConflictError, JobSpec, Launcher, Storage, Store
 from . import auth
@@ -72,6 +72,9 @@ MIRROR_ZIP_WORKERS = 16
 # The dashboard banner before the engine starts (dashboard_status)
 STATUS_CACHE_S = 5
 RUN_ID = re.compile(r"r[0-9a-f]{8}")
+# A run's optional name (spec.name: the host's name for it, e.g. "Run150"),
+# which names its downloads
+RUN_NAME_MAX = 100
 # Cleanup (clean_up, its own loop): a finished run's EFS directory outlives
 # it this long (a dashboard open at the end keeps working), and a cancelled
 # or abandoned run's upload archive this long (a cancelled run may be
@@ -360,6 +363,10 @@ class RunService:
             sha = actual
         elif sha is not None and not self.host_has_reference(host_id, sha):
             raise ServiceError(409, "Unknown reference: send the reference file with this run")
+        if spec.get("name") is not None:
+            name = spec["name"]
+            if not isinstance(name, str) or not name.strip() or len(name) > RUN_NAME_MAX:
+                raise ServiceError(400, f"name must be 1-{RUN_NAME_MAX} characters")
         if spec.get("mode", "batch") not in ("batch", "live"):
             raise ServiceError(400, "mode must be batch or live")
         if spec.get("input", "fastq") not in ("fastq", "pod5"):
@@ -367,6 +374,8 @@ class RunService:
         if spec.get("mode") == "live" and spec.get("input") == "pod5":
             raise ServiceError(400, "Live runs take FASTQ; live POD5 (basecalling while sequencing) is not built yet")
         spec = dict(spec)
+        if spec.get("name") is not None:
+            spec["name"] = spec["name"].strip()
         spec.pop("reference_sha256", None)
         if sha is not None:
             spec["reference_sha256"] = sha
@@ -1524,9 +1533,10 @@ class RunService:
         run = self.get_run(run_id, host_id)
         if run["state"] not in (SEALED, FAILED, INCOMPLETE) or not run.get("sealed"):
             raise ServiceError(409, f"Run is {run['state']}; results are available once it is sealed")
-        if package not in ("results", "output", "reads"):
+        if package not in DOWNLOAD_SUFFIX:
             raise ServiceError(404, "No such package")
-        return self.storage.presign_get(f"{self.run_prefix(run)}/{package}.zip")
+        return self.storage.presign_get(f"{self.run_prefix(run)}/{package}.zip",
+                                        filename=download_name(run, package))
 
     def log_url(self, run_id: str, host_id: Optional[str] = None) -> str:
         run = self.get_run(run_id, host_id)

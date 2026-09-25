@@ -3,12 +3,18 @@
 disk; the run API builds them from the run's EFS mirror when a job died
 before it could).
 
-- results.zip: the summary package MycoMap accepts today, plus the log
-- output.zip: the whole output minus scratch and debug
+- results.zip: the MycoMap summary package: summary/ as
+  speconsense-summarize wrote it, at the root of the zip, nothing added or
+  left out (speconsense-summarize owns that format; the suite writes
+  nothing of its own there). Downloaded as <run name>_Summary.zip.
+- output.zip: the rest worth keeping: the consensus FASTAs, the
+  identification tables, the iNat ID audit and the event log (the name is
+  kept for the /v1 route; downloaded as <run name>_Extras.zip)
 - reads.zip: the demultiplexed reads on their own (large, rarely wanted)
 """
 
 import os
+import re
 import shutil
 import struct
 import tempfile
@@ -25,15 +31,46 @@ from typing import Callable, Optional
 # cluster_debug holds speconsense's per-cluster reads (thousands of files)
 SEAL_SKIP_DIRS = {"snapshots", ".staging", "specimux", "cluster_debug"}
 
-PACKAGES: dict[str, Callable[[Path], bool]] = {
-    "results.zip": lambda rel: rel.parts[0] == "summary" or rel.as_posix() == "events.jsonl",
-    "output.zip": lambda rel: rel.parts[0] not in SEAL_SKIP_DIRS and "cluster_debug" not in rel.parts,
+EXTRA_FILES = {"events.jsonl", "inat_id_suggestions.tsv", "inat_id_corrections.tsv"}
+
+
+def _summary(rel: Path):
+    return "/".join(rel.parts[1:]) if rel.parts[0] == "summary" and len(rel.parts) > 1 else None
+
+
+def _extras(rel: Path) -> bool:
+    if rel.parts[0] in ("consensus", "identification"):
+        return "cluster_debug" not in rel.parts
+    return len(rel.parts) == 1 and rel.name in EXTRA_FILES
+
+
+# name -> select(path relative to the output dir): False/None leaves the
+# file out, True packs it under that path, a string under that name
+PACKAGES: dict[str, Callable[[Path], object]] = {
+    "results.zip": _summary,
+    "output.zip": _extras,
     "reads.zip": lambda rel: rel.parts[0] == "specimux",
 }
+# what a package is called when downloaded, after the run's name
+DOWNLOAD_SUFFIX = {"results": "Summary", "output": "Extras", "reads": "Reads"}
+DOWNLOAD_LABEL = {"results": "MycoMap summary", "output": "extras", "reads": "demultiplexed reads"}
 
 
-def package_files(out: Path, include: Callable[[Path], bool], extra: dict[str, Path] = None) -> list:
-    """(arcname, path) for the files under ``out`` that ``include`` takes.
+def download_stem(run: dict) -> str:
+    """What a run's downloads are named after: its name (spec.name) reduced
+    to filename-safe characters ("Run 150" -> "Run_150"), else its id."""
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", str((run.get("spec") or {}).get("name") or "")).strip("._-")
+    return name or run["id"]
+
+
+def download_name(run: dict, package: str) -> str:
+    """"Run150_Summary.zip" for the run's results.zip, and so on."""
+    return f"{download_stem(run)}_{DOWNLOAD_SUFFIX[package]}.zip"
+
+
+def package_files(out: Path, include: Callable[[Path], object], extra: dict[str, Path] = None) -> list:
+    """(arcname, path) for the files under ``out`` that ``include`` takes
+    (it returns True, or the name to pack the file under).
     Symlinked directories are not followed (the photo cache is a link into
     the mirror; photos are served from there, not packaged). ``extra`` adds
     files from elsewhere under the given names (the event log, which lives
@@ -43,10 +80,13 @@ def package_files(out: Path, include: Callable[[Path], bool], extra: dict[str, P
     if out.exists():
         for f in sorted(_walk_files(out)):
             rel = f.relative_to(out)
-            if not rel.name.endswith(".tmp") and include(rel):
-                files.append((rel.as_posix(), f))
-    for arcname, path in (extra or {}).items():
-        if Path(path).exists() and include(Path(arcname)) and arcname not in {a for a, _ in files}:
+            took = include(rel) if not rel.name.endswith(".tmp") else None
+            if took:
+                files.append((took if isinstance(took, str) else rel.as_posix(), f))
+    for name, path in (extra or {}).items():
+        took = include(Path(name))
+        arcname = took if isinstance(took, str) else name
+        if Path(path).exists() and took and arcname not in {a for a, _ in files}:
             files.append((arcname, Path(path)))
     return files
 

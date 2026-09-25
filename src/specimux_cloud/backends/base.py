@@ -47,7 +47,9 @@ class Storage(Protocol):
 
     def presign_put(self, key: str, expires_s: int = 3600) -> str: ...
 
-    def presign_get(self, key: str, expires_s: int = 3600) -> str: ...
+    def presign_get(self, key: str, expires_s: int = 3600, filename: Optional[str] = None) -> str:
+        """A GET URL; with ``filename``, the download is saved under that name."""
+        ...
 
 
 # --- Command queue ---

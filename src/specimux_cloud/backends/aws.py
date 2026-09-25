@@ -109,9 +109,11 @@ class S3Storage:
         return self.client.generate_presigned_url("put_object", Params={"Bucket": self.bucket, "Key": key},
                                                   ExpiresIn=expires_s, HttpMethod="PUT")
 
-    def presign_get(self, key: str, expires_s: int = 3600) -> str:
-        return self.client.generate_presigned_url("get_object", Params={"Bucket": self.bucket, "Key": key},
-                                                  ExpiresIn=expires_s)
+    def presign_get(self, key: str, expires_s: int = 3600, filename: Optional[str] = None) -> str:
+        params = {"Bucket": self.bucket, "Key": key}
+        if filename:
+            params["ResponseContentDisposition"] = f'attachment; filename="{filename}"'
+        return self.client.generate_presigned_url("get_object", Params=params, ExpiresIn=expires_s)
 
 
 # --- Command queue ---
