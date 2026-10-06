@@ -272,3 +272,52 @@ def test_sharing_a_run_publicly_from_the_run_page(stack):
     assert service.get_run(rid)["public"]["allow_starring"] is False
     client.post(f"/console/runs/{rid}/public", data={"action": "disable"})
     assert service.get_run(rid)["public"]["enabled"] is False and "Share publicly" in client.get(f"/console/runs/{rid}").text
+
+
+def test_running_a_run_again_from_its_page(stack):
+    client, service = stack
+    _login(client)
+    r = client.post("/console/new", data={"profile": "default", "min_reads": "7", "user_id": "user-1",
+                                          "client_token": "ct-again", "input": "pod5", "model": "sup@v5.2.0",
+                                          "min_length": "150", "max_length": "3000", "name": "Run155"}, files=FILES)
+    sid = re.search(r"<pre>(r[0-9a-f]{8})\.", r.text).group(1)
+    source = service.get_run(sid)
+    # basecalled, then the engine failed
+    keys = []
+    for n in "ab":
+        service.storage.put(f"archives/user-1/{source['archive_id']}/pod5/{n}.pod5", b"POD5")
+        keys.append(service.storage.put(f"runs/user-1/{sid}/fastq/{n}.fastq", b"@r\nA\n+\nI\n"))
+    service.store.update_run(sid, {
+        "state": "failed", "exit": {"code": 1, "generation": 2, "reported": time.time()},
+        "manifest": [{"key": f"archives/user-1/{source['archive_id']}/pod5/{n}.pod5", "size": 4, "etag": "x"} for n in "ab"],
+        "basecalled": [{"key": k.key, "size": k.size, "etag": k.etag} for k in keys],
+        "basecalling": {"done": 2, "total": 2, "reads_in": 9, "reads_out": 8}})
+    page = client.get(f"/console/runs/{sid}").text
+    assert f'href="/console/runs/{sid}/again"' in page and "Run again…" in page
+
+    form = client.get(f"/console/runs/{sid}/again").text
+    assert f"Run <code>{sid}</code> again" in form and 'value="Run155 rerun"' in form
+    assert 'name="start" value="engine" checked' in form and 'name="primers" required' not in form
+    assert 'value="7" min="1"' in form and '<option value="sup@v5.2.0" selected>' in form
+    assert 'value="150"' in form and '<option value="none">none</option>' in form
+
+    fixed = b">ITS1F\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4\nTCCTCCGCTTATTGATATGC\n"
+    r = client.post("/console/new", data={"rerun_of": sid, "start": "engine", "profile": "default", "min_reads": "5",
+                                          "name": "Run155 rerun", "user_id": "user-1", "client_token": "ct-again-2",
+                                          "model": "sup@v5.2.0", "min_length": "150", "max_length": "3000"},
+                    files={"primers": ("primers.fasta", fixed)})
+    assert r.status_code == 303, r.text
+    rid = r.headers["location"].rsplit("/", 1)[-1]
+    run = service.get_run(rid)
+    assert run["spec"]["rerun_of"] == sid and run["spec"]["start"] == "engine" and run["spec"]["min_reads"] == 5
+    assert run["state"] == "running" and service.storage.get(f"runs/user-1/{rid}/input/primers") == fixed
+    page = client.get(f"/console/runs/{rid}").text
+    assert "Rerun of" in page and f'href="/console/runs/{sid}"' in page and "from the engine" in page
+    assert f'href="/console/runs/{rid}"' in client.get(f"/console/runs/{sid}").text      # its reruns
+    assert "rerun of " + sid in client.get("/console/").text
+
+    # a refusal goes back to the form with the reason
+    r = client.post("/console/new", data={"rerun_of": sid, "start": "basecall", "profile": "default", "min_reads": "5",
+                                          "user_id": "user-1", "client_token": "ct-again-3", "model": "sup@v1",
+                                          "min_length": "150", "max_length": "3000"})
+    assert r.status_code == 303 and r.headers["location"].startswith(f"/console/runs/{sid}/again?error=")

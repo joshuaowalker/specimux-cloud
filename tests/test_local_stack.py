@@ -367,3 +367,52 @@ def test_live_fastq_end_to_end(stack, tmp_path):
     assert status["exit"]["code"] == 0 and set(status["exit"]["packages"]) == {"results.zip", "output.zip", "reads.zip"}
     log = (tmp_path / "data" / "logs" / f"{rid}-engine-1.log").read_text()
     assert "finalizing the engine" in log
+
+
+def test_reruns_from_the_engine_and_from_basecalling(stack, tmp_path, monkeypatch):
+    """A sealed POD5 run run again through ``submit --rerun-of``: from the
+    engine over its basecalled reads with a new specimens file, and from
+    basecalling with a wider length window that keeps the short reads."""
+    from specimux_cloud.uploader.submit import run as submit
+    monkeypatch.setenv("SPECIMUX_DORADO_DEVICE", "cpu")
+    base, service = stack
+    svc = {"X-Service-Key": KEY}
+    good = "".join(f"@r{i}\n{'ACGTACGTAC' * 50}\n+\n{'I' * 500}\n" for i in range(30))
+    short = "".join(f"@s{i}\nACGT\n+\nIIII\n" for i in range(5))
+    run = httpx.post(f"{base}/v1/runs", headers=svc,
+                     data={"spec": json.dumps({"mode": "batch", "input": "pod5", "min_reads": 5, "workers": 1,
+                                               "basecall": {"min_length": 400, "max_length": 2000}}),
+                           "user_id": "u1"},
+                     files={"primers": ("primers.fasta", b">ITS1F\nCTTGGTCATTTAGAGGAAGTAA\n"),
+                            "specimens": ("Index.txt", b"SampleID\tPrimerPool\nS1\tITS\n")}).json()
+    sid, jc = run["id"], {"Authorization": f"JobCode {run['job_code']}"}
+    r = httpx.post(f"{base}/v1/runs/{sid}/uploads", json={"files": ["one.pod5"]}, headers=jc)
+    httpx.put(r.json()["uploads"]["one.pod5"]["url"], content=(good + short).encode())
+    httpx.post(f"{base}/v1/runs/{sid}/complete", headers=jc)
+
+    def sealed(rid):
+        return _wait(lambda: (lambda s: s if s["state"] in ("sealed", "failed") and s.get("sealed") else None)(
+            httpx.get(f"{base}/v1/runs/{rid}", headers=svc).json()), 120, f"{rid} to seal")
+
+    def s1_reads(rid):
+        tok = httpx.post(f"{base}/v1/runs/{rid}/tokens", json={"user": "u1", "scope": "view"}, headers=svc).json()
+        browser = httpx.Client(base_url=base)
+        browser.post("/v1/session", headers={"Authorization": f"Bearer {tok['token']}"})
+        return browser.get(f"/v1/runs/{rid}/api/state").json()["specimens"]["S1"]["total_reads"]
+    assert sealed(sid)["state"] == "sealed" and s1_reads(sid) == 30
+
+    (tmp_path / "Index.txt").write_bytes(b"SampleID\tPrimerPool\nS1\tITS\nS2\tITS\n")
+    common = ["--run-api", base, "--service-key", KEY, "--rerun-of", sid, "--user", "u1",
+              "--wait", "--results", str(tmp_path / "results")]
+    assert submit(common + ["--specimens", str(tmp_path / "Index.txt"), "--name", "again"]) == 0
+    first = sorted(service.store.list_runs(host="dev"), key=lambda r: r["created"])[-1]
+    assert first["spec"]["rerun_of"] == sid and first["state"] == "sealed" and first["generation"] == 1
+    assert (tmp_path / "results" / "again_Summary.zip").exists()
+    assert s1_reads(first["id"]) == 30
+    assert service.storage.get(f"runs/u1/{first['id']}/input/specimens").endswith(b"S2\tITS\n")
+
+    assert submit(common + ["--start", "basecall", "--min-length", "1"]) == 0
+    second = sorted(service.store.list_runs(host="dev"), key=lambda r: r["created"])[-1]
+    assert second["spec"]["basecall"]["min_length"] == 1 and second["spec"]["basecall"]["max_length"] == 2000
+    assert second["state"] == "sealed" and second["basecalling"]["reads_out"] == 35
+    assert s1_reads(second["id"]) == 35

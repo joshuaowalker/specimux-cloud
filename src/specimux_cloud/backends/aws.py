@@ -94,6 +94,11 @@ class S3Storage:
                 out.append(ObjectInfo(o["Key"], int(o["Size"]), self._etag(o.get("ETag", ""))))
         return out
 
+    def copy(self, src: str, dst: str) -> ObjectInfo:
+        # the managed copy: multipart above 5 GB, where CopyObject stops
+        self.client.copy({"Bucket": self.bucket, "Key": src}, self.bucket, dst)
+        return self.head(dst)
+
     def delete(self, key: str) -> None:
         self.client.delete_object(Bucket=self.bucket, Key=key)
 

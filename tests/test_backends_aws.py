@@ -38,13 +38,16 @@ def test_s3_storage(tmp_path):
     src.write_bytes(b"x" * 10)
     s.put_file("runs/u/r/fastq/b.fastq", src)
     assert [o.key for o in s.list("runs/u/r/fastq/")] == ["runs/u/r/fastq/a.fastq", "runs/u/r/fastq/b.fastq"]
+    # a server-side copy (a rerun's own copy of the reads)
+    copied = s.copy("runs/u/r/fastq/a.fastq", "runs/u/r/copy/a.fastq")
+    assert copied.key == "runs/u/r/copy/a.fastq" and copied.size == 9 and s.get(copied.key) == b"@r\nA\n+\nI\n"
     dest = tmp_path / "dl" / "a.fastq"
     s.download(info.key, dest)
     assert dest.read_bytes() == b"@r\nA\n+\nI\n"
     url = s.presign_put("runs/u/r/fastq/c.fastq", expires_s=60)
     assert "Signature=" in url and "c.fastq" in url and "Expires" in url   # moto signs v2; real S3 v4
     assert "Signature=" in s.presign_get(info.key)
-    assert s.delete_prefix("runs/u/r") == 2
+    assert s.delete_prefix("runs/u/r") == 3
     assert s.list("runs") == []
 
 

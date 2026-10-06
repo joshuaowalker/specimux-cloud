@@ -226,6 +226,26 @@ creation (see "Basecalling stage").
 | `sealed` / `failed` | the seal finished after exit 0 / anything else |
 | `incomplete` | an upload was abandoned (below); keeps what arrived, never reports success |
 
+**Reruns.** A finished run (sealed or failed) runs again as a new run:
+`POST /v1/runs` with `spec.rerun_of` and `spec.start`, `engine` (the
+default) or `basecall` (POD5 only). It never uploads: it is created
+with the source's manifest and goes straight to `input_complete`, and
+the create returns no job code. Primers, specimens, the reference,
+profile, minimum reads and the basecalling settings are the source's
+unless the request replaces them (`reference_sha256: none` drops the
+reference); it is always batch, and belongs to the source's user, under
+whose prefix the input lives. From basecalling it runs over the source's
+archive (`archive_id`, with the archive rules under "Storage") and
+writes its own FASTQs. From the engine over a POD5 run's basecalled
+reads it gets its own server-side copy of them, so either run can be
+deleted without the other, and the source may even have been cancelled
+after basecalling; over a FASTQ run it reads the archive. The copy runs
+in the create request (16 at a time); a create that dies part way
+leaves a `created` rerun that a retried create (same client token) or
+reconcile finishes. Retry stays what it is: the same run's failed stage
+again with the same settings. The console's **Run again…** is a form
+filled in with the source's settings; both run pages link to each other.
+
 **Abandoned uploads.** The two-minute reconcile ends a run with no upload
 request for 24 hours, or created and never uploaded to within 7 days (a
 lab may create a run days before sequencing ends), as `incomplete` with
@@ -472,7 +492,10 @@ prefix, must be one plain path segment), and only once the run that
 uploaded it finished without being cancelled, so an archive that cleanup
 may delete is never another run's input. Only the run that made an
 archive ever deletes it. Restoring objects from Deep Archive first is not
-built.
+built, so a run over an archive is refused once it is 28 days old
+(`ARCHIVE_WARM_S`: two days' margin before the 30-day transition, so no
+job meets it mid-run); a rerun from basecalled reads is not affected,
+since `runs/` stays in standard storage.
 
 **References are content-addressed.** A run's reference database is stored
 once at `references/sha256/<hex>`, and the spec records the hash and a

@@ -142,6 +142,13 @@ chat and git repositories.
    has **Upload is complete**, **Cancel** (stops a run at whatever stage
    it is in) and **Retry** (runs a failed run's failed stage again;
    basecalling skips the files it already delivered).
+5. **Run again…** on a finished run starts a new run over its input,
+   with nothing uploaded: from the basecalled reads (the pipeline only,
+   e.g. with corrected primers or specimens, another reference or other
+   settings) or, for a POD5 run, from basecalling with new basecalling
+   settings. What you leave as it was stays the source run's. Each run
+   links to the other. Basecalling again needs an upload less than 28
+   days old: after 30 days uploads move to cold storage.
 
 The runs list shows the whole service's load (runs busy and queued per
 stage, and any waiting for a machine), which explains a wait before
@@ -174,8 +181,15 @@ POD5 input is detected from the files; `--model`, `--min-length`,
 uploader keeps watching. The service keeps each reference database once,
 by its SHA-256, so `submit` sends a reference only the first time your
 host uses it (another host's copy is never lent: each host sends a
-reference once itself). One run
-at a time:
+reference once itself). A finished run runs again with `--rerun-of <run id>` and no input files
+(`--start basecall` for basecalling again; files and settings not given
+are the source run's, `--no-reference` leaves its reference out):
+
+```bash
+specimux-cloud submit --run-api URL --service-key KEY --rerun-of r7503b970 --primers fixed.fasta --wait
+```
+
+One run at a time:
 
 ```bash
 specimux-cloud run status|cancel|retry <run id> --run-api URL --service-key KEY [--reason TEXT]

@@ -96,6 +96,18 @@ LIVE_ENGINE_TIMEOUT_S = 96 * 3600
 ENGINE_STAGE = "engine"
 DORADO_STAGE = "dorado"
 DEFAULT_STAGE_SLOTS = {ENGINE_STAGE: 2, DORADO_STAGE: 2}
+# A rerun (spec.rerun_of) is a new run over a finished run's input, starting
+# at basecalling (the uploaded POD5, new basecalling settings) or at the
+# engine (the basecalled or uploaded FASTQ). It takes the source's files
+# and settings unless its own spec or files replace them.
+RERUN_STARTS = ("basecall", "engine")
+RERUN_INHERITS = ("profile", "min_reads", "reprocess_ratio", "workers", "vcpus")
+RERUN_COPY_WORKERS = 16
+# S3 moves archives/ to Glacier Deep Archive 30 days after upload
+# (infra/stack.py), and restoring from it is not built: a run over an
+# archive older than this is refused, with two days' margin so no job
+# meets the transition mid-run.
+ARCHIVE_WARM_S = 28 * 24 * 3600
 
 
 def stage_of(run: dict, stage: str) -> dict:
@@ -341,20 +353,12 @@ class RunService:
         if not USER_ID.fullmatch(user_id or ""):
             raise ServiceError(400, "user_id must be 1-128 letters, digits and . _ @ + -, "
                                     "starting with a letter or digit")
-        if spec.get("archive_id"):
-            # running again over an earlier upload: only the same host's
-            # archive for the same user (an archive id is not a secret)
-            archive = self.store.get_archive(str(spec["archive_id"]))
-            if (not archive or archive.get("deleted") or archive.get("host") != host_id
-                    or archive.get("user_id") != user_id):
-                raise ServiceError(404, "No such archive for this user")
-            # only a finished upload: the archive of a cancelled or abandoned
-            # run is deleted (clean_up), so no other run may come to need it
-            origin = self.store.get_run(archive.get("run") or "")
-            if not origin or origin["state"] not in (SEALED, FAILED) or _cancelled(origin):
-                raise ServiceError(409, "That archive's run did not finish; it cannot be run again")
-            if archive.get("input", "fastq") != spec.get("input", "fastq"):
-                raise ServiceError(400, f"archive holds {archive.get('input', 'fastq')} input")
+        source = None
+        if spec.get("rerun_of") is not None:
+            source, spec, files, reference_sha256 = self._rerun_inputs(spec, user_id, host_id, files,
+                                                                       reference_sha256)
+        if spec.get("archive_id") and (source is None or self._rerun_reads_archive(spec)):
+            self._check_archive(str(spec["archive_id"]), host_id, user_id, spec.get("input", "fastq"))
         files = dict(files)
         reference = files.pop("reference", None)
         sha = (reference_sha256 or "").strip().lower() or None
@@ -388,7 +392,9 @@ class RunService:
         spec.pop("reference_sha256", None)
         if sha is not None:
             spec["reference_sha256"] = sha
-        if spec.get("input", "fastq") == "pod5":
+        if source is not None and spec["start"] == "engine" and spec.get("input") == "pod5":
+            pass   # the settings that made the reads, as the source recorded them
+        elif spec.get("input", "fastq") == "pod5":
             spec["basecall"] = self._basecall_settings(spec.get("basecall") or {})
         elif spec.get("basecall"):
             raise ServiceError(400, "basecall settings apply to POD5 input only")
@@ -416,6 +422,8 @@ class RunService:
         stored = self.store.create_run(run, client_token=f"{host_id}:{client_token}" if client_token else None)
         if stored["id"] != run_id:
             # a retried create: the existing run, without a secret (shown once)
+            if stored["spec"].get("rerun_of") and stored["state"] == CREATED:
+                stored = self._start_rerun(stored)
             return self._public(stored)
         for role, data in files.items():
             self.storage.put(f"{self.run_prefix(run)}/input/{role}", data)
@@ -426,10 +434,128 @@ class RunService:
         if not spec.get("archive_id"):
             self.store.put_archive({"id": run["archive_id"], "run": run_id, "host": host_id, "user_id": user_id,
                                     "input": spec.get("input", "fastq"), "created": time.time()})
+        if source is not None:
+            # no upload: the input is the source's (no job code either)
+            return self._public(self._start_rerun(stored))
         out = self._public(stored)
         out["upload_secret"] = secret
         out["job_code"] = f"{run_id}.{secret}"
         return out
+
+    def _check_archive(self, archive_id: str, host_id: str, user_id: str, kind: str) -> dict:
+        """An earlier upload a new run may run over: only the same host's
+        archive for the same user (an archive id is not a secret), only
+        once the run that uploaded it finished, and only while it is still
+        in ordinary storage."""
+        archive = self.store.get_archive(archive_id)
+        if (not archive or archive.get("deleted") or archive.get("host") != host_id
+                or archive.get("user_id") != user_id):
+            raise ServiceError(404, "No such archive for this user")
+        # only a finished upload: the archive of a cancelled or abandoned
+        # run is deleted (clean_up), so no other run may come to need it
+        origin = self.store.get_run(archive.get("run") or "")
+        if not origin or origin["state"] not in (SEALED, FAILED) or _cancelled(origin):
+            raise ServiceError(409, "That archive's run did not finish; it cannot be run again")
+        if archive.get("input", "fastq") != kind:
+            raise ServiceError(400, f"archive holds {archive.get('input', 'fastq')} input")
+        age = time.time() - float(archive.get("created") or time.time())
+        if age > ARCHIVE_WARM_S:
+            raise ServiceError(409, f"That upload is {int(age // 86400)} days old: uploads move to cold storage "
+                                    f"30 days after upload, and running over them again is not supported yet")
+        return archive
+
+    @staticmethod
+    def _rerun_reads_archive(spec: dict) -> bool:
+        """Whether a rerun's jobs read its source's upload: basecalling
+        again, or an engine over uploaded FASTQ (an engine over basecalled
+        reads reads its own copy of them instead)."""
+        return spec["start"] == "basecall" or spec.get("input", "fastq") == "fastq"
+
+    def _rerun_inputs(self, spec: dict, user_id: str, host_id: str, files: dict,
+                      reference_sha256: Optional[str]) -> tuple[dict, dict, dict, Optional[str]]:
+        """A rerun's source run, and its spec, files and reference with the
+        source's filling in what the request leaves out."""
+        source = self.store.get_run(str(spec["rerun_of"]))
+        if source is None or source.get("host") != host_id:
+            raise ServiceError(404, "No such run to run again")
+        if source.get("user_id") != user_id:
+            # the input lives under the source's user (storage prefixes)
+            raise ServiceError(400, f"A rerun belongs to the source run's user, {source['user_id']}")
+        if source["state"] not in (SEALED, FAILED):
+            raise ServiceError(409, f"Run {source['id']} is {source['state']}; only a finished run can be run again")
+        kind = source["spec"].get("input", "fastq")
+        start = spec.get("start") or "engine"
+        if start not in RERUN_STARTS:
+            raise ServiceError(400, f"start must be one of {', '.join(RERUN_STARTS)}")
+        if start == "basecall" and kind != "pod5":
+            raise ServiceError(400, "Only a POD5 run can be basecalled again")
+        if spec.get("mode", "batch") != "batch":
+            raise ServiceError(400, "A rerun is a batch run")
+        if spec.get("input", kind) != kind:
+            raise ServiceError(400, f"A rerun runs over its source's {kind} input")
+        if spec.get("archive_id") not in (None, source["archive_id"]):
+            raise ServiceError(400, "A rerun runs over its source's upload; leave out archive_id")
+        if start == "engine" and spec.get("basecall"):
+            raise ServiceError(400, "Basecalling settings apply to a rerun that starts at basecalling")
+        if not source.get("manifest"):
+            raise ServiceError(409, f"Run {source['id']}'s upload was never completed; there is no input to run again")
+        if start == "engine" and kind == "pod5":
+            if not source.get("basecalled"):
+                raise ServiceError(409, f"Run {source['id']} did not finish basecalling; "
+                                        "run it again from basecalling instead")
+            present = {o.key for o in self.storage.list(f"{self.run_prefix(source)}/fastq/")}
+            if any(b["key"] not in present for b in source["basecalled"]):
+                raise ServiceError(409, f"Run {source['id']}'s basecalled reads are gone; "
+                                        "run it again from basecalling instead")
+        given = {k: v for k, v in spec.items() if v is not None}
+        out = {k: source["spec"][k] for k in RERUN_INHERITS if source["spec"].get(k) is not None}
+        out.update(given)
+        out.update(mode="batch", input=kind, rerun_of=source["id"], start=start, archive_id=source["archive_id"])
+        if start == "basecall":
+            out["basecall"] = {**(source["spec"].get("basecall") or {}), **(spec.get("basecall") or {})}
+        elif kind == "pod5":
+            out["basecall"] = source["spec"].get("basecall")
+        files = dict(files)
+        for role in ("primers", "specimens"):
+            if role not in files:
+                files[role] = self.storage.get(f"{self.run_prefix(source)}/input/{role}")
+        if (reference_sha256 or "").strip().lower() == "none":
+            # the source's reference left out on purpose
+            reference_sha256 = None
+            out.pop("reference_name", None)
+        elif "reference" not in files and not reference_sha256:
+            reference_sha256 = source["spec"].get("reference_sha256")
+            if reference_sha256 and source["spec"].get("reference_name"):
+                out["reference_name"] = source["spec"]["reference_name"]
+        return source, out, files, reference_sha256
+
+    def _start_rerun(self, run: dict) -> dict:
+        """Give a created rerun its input and queue it for its first stage:
+        the source's manifest (its upload), and for an engine over
+        basecalled reads its own copy of them, so either run can be deleted
+        without the other. Repeatable: a retried create, or reconcile after
+        a crash, finishes what was started."""
+        source = self.get_run(run["spec"]["rerun_of"])
+        updates = {"state": INPUT_COMPLETE, "manifest": source["manifest"], "input_completed": time.time()}
+        if run["spec"]["start"] == "engine" and run["spec"].get("input") == "pod5":
+            from concurrent.futures import ThreadPoolExecutor
+
+            def copy(entry):
+                info = self.storage.copy(entry["key"], f"{self.run_prefix(run)}/fastq/{entry['key'].rsplit('/', 1)[-1]}")
+                return {"key": info.key, "size": info.size, "etag": info.etag}
+            with ThreadPoolExecutor(RERUN_COPY_WORKERS) as pool:
+                basecalled = sorted(pool.map(copy, source["basecalled"]), key=lambda b: b["key"])
+            done = source.get("basecalling") or {}
+            updates["basecalled"] = basecalled
+            updates["basecalling"] = {"done": len(basecalled), "total": len(basecalled),
+                                      "reads_in": done.get("reads_in", 0), "reads_out": done.get("reads_out", 0),
+                                      "finished": time.time(), "copied_from": source["id"]}
+        try:
+            run = self.store.update_run(run["id"], updates, expected_state=[CREATED])
+        except ConflictError:
+            return self.get_run(run["id"])    # started already
+        logger.info(f"Run {run['id']}: a rerun of {source['id']} from {run['spec']['start']}")
+        return self._try_launch(run["id"]) or run
 
     @staticmethod
     def reference_key(sha256: str) -> str:
@@ -1894,6 +2020,13 @@ class RunService:
                 threading.Thread(target=self._seal_and_finish, args=(run["id"], code if code else 1),
                                  name=f"seal-{run['id']}", daemon=True).start()
                 failed += 1
+        # a rerun whose create stopped before its input was in place
+        for run in self.store.list_runs(states=[CREATED]):
+            if run["spec"].get("rerun_of") and now - float(run.get("created") or now) >= intent_grace_s:
+                try:
+                    self._start_rerun(run)
+                except Exception:
+                    logger.exception(f"Starting rerun {run['id']} failed")
         # a seal interrupted by a restart: finish it
         for run in self.store.list_runs(states=[SEALING]):
             if not any(t.name == f"seal-{run['id']}" for t in threading.enumerate()):

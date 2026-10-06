@@ -105,6 +105,9 @@ class DirectoryStorage:
                 out.append(ObjectInfo(key, p.stat().st_size, _etag(p)))
         return out
 
+    def copy(self, src: str, dst: str) -> ObjectInfo:
+        return self.put_file(dst, self._path(src))
+
     def delete(self, key: str) -> None:
         self._path(key).unlink(missing_ok=True)
 

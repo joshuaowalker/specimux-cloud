@@ -1320,3 +1320,174 @@ def test_a_run_name_names_the_downloads(api):
         r = create(bad)
         assert r.status_code == 400 and "control or formatting" in r.json()["error"], bad
     assert create("Réunion 2026 — Φ").status_code == 200           # other Unicode is fine
+
+
+# --- reruns ---
+
+def _sealed_pod5(client, service, launcher, ref=None):
+    """A POD5 run basecalled (two files) and sealed, with a reference."""
+    files = dict(POD5_FILES)
+    if ref:
+        files["reference"] = ("refs.fasta", ref)
+    spec = {"mode": "batch", "input": "pod5", "profile": "default", "min_reads": 7,
+            "basecall": {"model": "sup@v5.2.0", "min_length": 150}}
+    run = client.post("/v1/runs", data={"spec": json.dumps(spec), "user_id": "u42"}, files=files,
+                      headers={"X-Service-Key": KEY}).json()
+    rid = run["id"]
+    manifest, hdr = _upload_pod5(client, run, ["a.pod5", "b.pod5"])
+    client.post(f"/v1/runs/{rid}/complete", json={"manifest": manifest}, headers=hdr)
+    dor = {"X-Job-Secret": launcher.specs[-1].env["SPECIMUX_JOB_SECRET"]}
+    bundle = client.get(f"/v1/runs/{rid}/job", headers=dor).json()
+    for name, up in bundle["fastq_uploads"].items():
+        client.put(up["url"], content=f"@{name}\nACGT\n+\nIIII\n".encode())
+        client.post(f"/v1/runs/{rid}/basecalled", json={"generation": 1, "name": name, "key": up["key"],
+                                                       "reads_in": 5, "reads_out": 4}, headers=dor)
+    assert client.post(f"/v1/runs/{rid}/exit", json={"generation": 1, "exit_code": 0}, headers=dor).json()["state"] == "running"
+    eng = {"X-Job-Secret": launcher.specs[-1].env["SPECIMUX_JOB_SECRET"]}
+    client.post(f"/v1/runs/{rid}/exit", json={"generation": 2, "exit_code": 1}, headers=eng)
+    _wait_state(service, rid, ["failed"])          # the engine failed (bad primers, say)
+    return service.get_run(rid)
+
+
+def _rerun(client, source_id, spec=None, files=None, data=None, key=KEY, user="u42"):
+    body = {"spec": json.dumps({"rerun_of": source_id, **(spec or {})}), "user_id": user, **(data or {})}
+    return client.post("/v1/runs", data=body, files=files or {}, headers={"X-Service-Key": key})
+
+
+def test_a_rerun_from_the_basecalled_reads(api):
+    """Run155's case: the engine failed on bad primers; a rerun with new
+    primers starts at the engine over its own copy of the basecalled reads,
+    with the source's other files and settings."""
+    client, service, launcher = api
+    source = _sealed_pod5(client, service, launcher, ref=b'>R name="Amanita"\nACGT\n')
+    sid = source["id"]
+    fixed = b">ITS1F\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4\nTCCTCCGCTTATTGATATGC\n"
+    r = _rerun(client, sid, {"name": "Run155 rerun"}, files={"primers": ("primers.fasta", fixed)})
+    assert r.status_code == 200, r.text
+    run = r.json()
+    rid = run["id"]
+    assert "job_code" not in run and "upload_secret" not in run          # nothing to upload
+    assert run["state"] == "running" and launcher.specs[-1].name == f"{rid}-engine-1"
+    spec = run["spec"]
+    assert (spec["rerun_of"], spec["start"], spec["mode"], spec["input"]) == (sid, "engine", "batch", "pod5")
+    assert spec["name"] == "Run155 rerun" and spec["min_reads"] == 7 and spec["profile"] == "default"
+    assert spec["basecall"] == source["spec"]["basecall"]                 # what made the reads
+    assert spec["reference_sha256"] == source["spec"]["reference_sha256"] and spec["reference_name"] == "refs.fasta"
+    assert run["archive_id"] == source["archive_id"] and run["manifest"] == source["manifest"]
+    assert run["basecalling"]["copied_from"] == sid and run["basecalling"]["reads_out"] == 8
+    # its own reads, primers replaced, specimens and reference the source's
+    bundle = client.get(f"/v1/runs/{rid}/job",
+                        headers={"X-Job-Secret": launcher.specs[-1].env["SPECIMUX_JOB_SECRET"]}).json()
+    assert [b["key"] for b in bundle["reads"]] == [f"runs/u42/{rid}/fastq/a.fastq", f"runs/u42/{rid}/fastq/b.fastq"]
+    assert client.get(bundle["reads"][0]["url"]).content == b"@a.fastq\nACGT\n+\nIIII\n"
+    assert client.get(bundle["inputs"]["primers"]).content == fixed
+    assert client.get(bundle["inputs"]["specimens"]).content == POD5_FILES["specimens"][1]
+    assert "reference" in bundle["inputs"]
+    # either run can be deleted without the other
+    assert client.delete(f"/v1/runs/{sid}", headers={"X-Service-Key": KEY}).status_code == 200
+    assert service.storage.head(f"runs/u42/{rid}/fastq/a.fastq")
+    assert service.storage.list(f"archives/u42/{source['archive_id']}/")     # a processed upload stays
+
+
+def test_a_rerun_from_basecalling_and_its_settings(api):
+    client, service, launcher = api
+    source = _sealed_pod5(client, service, launcher)
+    sid = source["id"]
+    r = _rerun(client, sid, {"start": "basecall", "basecall": {"min_length": 400, "max_length": 2000}})
+    assert r.status_code == 200, r.text
+    run = r.json()
+    rid = run["id"]
+    assert run["state"] == "basecalling" and launcher.specs[-1].name == f"{rid}-dorado-1"
+    # the source's settings, these two replaced
+    assert run["spec"]["basecall"] == {"model": "sup@v5.2.0", "min_length": 400, "max_length": 2000, "min_qscore": None}
+    assert run.get("basecalled") is None
+    bundle = client.get(f"/v1/runs/{rid}/job",
+                        headers={"X-Job-Secret": launcher.specs[-1].env["SPECIMUX_JOB_SECRET"]}).json()
+    assert [p["key"] for p in bundle["pod5"]] == [m["key"] for m in source["manifest"]]
+    assert bundle["fastq_uploads"]["a.fastq"]["key"] == f"runs/u42/{rid}/fastq/a.fastq"
+    assert bundle["basecalled"] == []
+    # a model the image doesn't bake is refused as for any run
+    assert _rerun(client, sid, {"start": "basecall", "basecall": {"model": "sup@v1"}}).status_code == 400
+
+
+def test_a_rerun_of_a_fastq_run(api):
+    client, service, launcher = api
+    first = _create(client)
+    _upload(client, first, "x.fastq", b"@r\nA\n+\nI\n")
+    client.post(f"/v1/runs/{first['id']}/complete", headers={"Authorization": f"JobCode {first['job_code']}"})
+    eng = {"X-Job-Secret": launcher.specs[-1].env["SPECIMUX_JOB_SECRET"]}
+    client.post(f"/v1/runs/{first['id']}/exit", json={"generation": 1, "exit_code": 0}, headers=eng)
+    _wait_state(service, first["id"], ["sealed"])
+    assert _rerun(client, first["id"], {"start": "basecall"}).status_code == 400     # nothing to basecall
+    r = _rerun(client, first["id"], {"min_reads": 3})
+    assert r.status_code == 200, r.text
+    run = r.json()
+    assert run["state"] == "running" and run["spec"]["min_reads"] == 3 and run["spec"]["input"] == "fastq"
+    bundle = client.get(f"/v1/runs/{run['id']}/job",
+                        headers={"X-Job-Secret": launcher.specs[-1].env["SPECIMUX_JOB_SECRET"]}).json()
+    assert [b["key"] for b in bundle["reads"]] == [m["key"] for m in service.get_run(first["id"])["manifest"]]
+
+
+def test_what_a_rerun_refuses(api):
+    client, service, launcher = api
+    source = _sealed_pod5(client, service, launcher, ref=b'>R name="Amanita"\nACGT\n')
+    sid = source["id"]
+    other_host, other_key = service.add_host("elsewhere", name="Elsewhere", label="server")
+    assert _rerun(client, sid, key=other_key).status_code == 404                     # another host's run
+    assert _rerun(client, "r00000000").status_code == 404
+    r = _rerun(client, sid, user="u43")
+    assert r.status_code == 400 and "u42" in r.json()["error"]                       # another user's input
+    assert _rerun(client, sid, {"start": "later"}).status_code == 400
+    assert _rerun(client, sid, {"mode": "live"}).status_code == 400
+    assert _rerun(client, sid, {"input": "fastq"}).status_code == 400
+    assert _rerun(client, sid, {"archive_id": "a00000000"}).status_code == 400
+    assert _rerun(client, sid, {"basecall": {"min_length": 400}}).status_code == 400  # engine start
+    # an active run is not a source
+    active = _create_pod5(client).json()
+    r = _rerun(client, active["id"])
+    assert r.status_code == 409 and "only a finished run" in r.json()["error"]
+    # the source's reference can be left out
+    r = _rerun(client, sid, data={"reference_sha256": "none"})
+    assert r.status_code == 200 and "reference_sha256" not in r.json()["spec"]
+    assert "reference_name" not in r.json()["spec"]
+
+    # uploads move to cold storage after 30 days: basecalling again is
+    # refused well before; the basecalled reads are not in the archive
+    archive = service.store.get_archive(source["archive_id"])
+    service.store.put_archive({**archive, "created": time.time() - 29 * 86400})
+    r = _rerun(client, sid, {"start": "basecall"})
+    assert r.status_code == 409 and "cold storage" in r.json()["error"]
+    assert _rerun(client, sid).status_code == 200
+
+    # basecalled reads that are gone, or never were
+    service.storage.delete(source["basecalled"][0]["key"])
+    r = _rerun(client, sid)
+    assert r.status_code == 409 and "from basecalling" in r.json()["error"]
+    service.store.update_run(sid, {"basecalled": None})
+    r = _rerun(client, sid)
+    assert r.status_code == 409 and "did not finish basecalling" in r.json()["error"]
+
+
+def test_a_rerun_interrupted_while_copying_is_finished_later(api):
+    """The copy of the reads happens in the create request; a create that
+    dies part way leaves a created rerun that a retried create, or
+    reconcile, finishes."""
+    client, service, launcher = api
+    source = _sealed_pod5(client, service, launcher)
+    real_copy = service.storage.copy
+    service.storage.copy = lambda src, dst: (_ for _ in ()).throw(OSError("network"))
+    with pytest.raises(OSError):
+        _rerun(client, source["id"], data={"client_token": "rr-1"})
+    stuck = [r for r in service.store.list_runs(states=["created"]) if r["spec"].get("rerun_of")]
+    assert len(stuck) == 1
+    service.storage.copy = real_copy
+    again = _rerun(client, source["id"], data={"client_token": "rr-1"}).json()     # the retried create
+    assert again["id"] == stuck[0]["id"] and again["state"] == "running"
+
+    service.storage.copy = lambda src, dst: (_ for _ in ()).throw(OSError("network"))
+    with pytest.raises(OSError):
+        _rerun(client, source["id"])
+    stuck = [r for r in service.store.list_runs(states=["created"]) if r["spec"].get("rerun_of")]
+    service.storage.copy = real_copy
+    service.reconcile(intent_grace_s=0)
+    assert service.get_run(stuck[0]["id"])["state"] == "input_complete"   # the engine slot is busy: queued

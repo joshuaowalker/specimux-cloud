@@ -103,6 +103,7 @@ th {{ color: var(--muted); font-weight: 500; font-size: 13px; }}
 .state {{ font-variant: small-caps; }} .muted {{ color: var(--muted); }}
 form.card, .card {{ border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin: 16px 0; }}
 label {{ display: block; margin: 10px 0 4px; font-size: 13px; color: var(--muted); }}
+label.choice {{ color: inherit; font-size: 15px; margin: 4px 0; }}
 input[type=text], input[type=number], input[type=password], select {{ width: 100%; max-width: 480px; padding: 6px 8px; font: inherit; color: inherit; background: transparent; border: 1px solid var(--line); border-radius: 4px; }}
 button {{ font: inherit; padding: 6px 12px; border-radius: 4px; border: 1px solid var(--line); background: transparent; color: inherit; cursor: pointer; }}
 button.primary {{ background: var(--accent); color: #fff; border-color: var(--accent); }}
@@ -179,6 +180,8 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
         results = (f'<a href="{mount}/runs/{esc(rid)}/results.zip">{esc(download_name(run, "results"))}</a>'
                    if run.get("sealed") and not run["sealed"].get("error") else '<span class="muted">—</span>')
         name = f'<br>{esc(spec["name"])}' if spec.get("name") else ""
+        if spec.get("rerun_of"):
+            name += f'<br><span class="muted">rerun of {esc(spec["rerun_of"])}</span>'
         return (f'<tr><td><a href="{mount}/runs/{esc(rid)}"><code>{esc(rid)}</code></a>{name}</td>'
                 f'<td class="state">{esc(state)}<br><span class="muted">{esc(STATE_HELP.get(state, ""))}</span></td>'
                 f'<td>{esc(spec.get("mode", "batch"))} · {esc(spec.get("input", "fastq"))}</td>'
@@ -236,11 +239,28 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
         user = whoami(request)
         if not user:
             return login_redirect(f"{mount}/new")
+        return await run_form(user, error)
+
+    @app.get("/runs/{run_id}/again")
+    async def again_form(request: Request, run_id: str, error: Optional[str] = None):
+        user = whoami(request)
+        if not user:
+            return login_redirect(f"{mount}/runs/{quote(run_id)}/again")
+        async with client(user["key"]) as c:
+            r = await c.get(f"/v1/runs/{run_id}")
+        if r.status_code != 200:
+            return page("Run again", f'<p class="error">{esc(await api_error(r))}</p>', user)
+        return await run_form(user, error, source=r.json())
+
+    async def run_form(user: dict, error: Optional[str], source: Optional[dict] = None) -> HTMLResponse:
+        """The new-run form; with ``source``, the form for running that run
+        again, filled in with its settings (files left empty keep its)."""
         async with client(user["key"]) as c:
             r = await c.get("/v1/options")
             listed = await c.get("/v1/runs")
             load = await fetch_load(c)
         opts = r.json() if r.status_code == 200 else {}
+        src = (source or {}).get("spec") or {}
         # references this host's runs used, newest first: the service keeps
         # them by content, so a later run names one instead of sending it again
         used: dict[str, str] = {}
@@ -249,14 +269,26 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
             sha = (run.get("spec") or {}).get("reference_sha256")
             if sha and not used.get(sha):
                 used[sha] = (run.get("spec") or {}).get("reference_name") or ""
-        profiles = "".join(f'<option value="{esc(p)}"{" selected" if p == "default" else ""}>{esc(p)}</option>'
+        profile = src.get("profile") or "default"
+        profiles = "".join(f'<option value="{esc(p)}"{" selected" if p == profile else ""}>{esc(p)}</option>'
                            for p in (opts.get("profiles") or ["default"]))
-        refs = "".join(f'<option value="{esc(sha)}">{esc(name or "reference")} ({esc(sha[:12])})</option>' for sha, name in used.items())
-        bc = opts.get("basecall_defaults") or {}
+        bc = {**(opts.get("basecall_defaults") or {}), **{k: v for k, v in (src.get("basecall") or {}).items()}}
         models = "".join(f'<option value="{esc(m)}"{" selected" if m == bc.get("model") else ""}>{esc(m)}</option>'
                          for m in (opts.get("dorado_models") or []))
         err = f'<p class="error">{esc(error)}</p>' if error else ""
-        return page("New run", f"""
+        pod5 = src.get("input") == "pod5"
+        basecalling = f"""<fieldset><legend>Basecalling ({"when starting at basecalling" if source else "POD5 input only"})</legend>
+<label for="model">Dorado model</label><select id="model" name="model">{models}</select>
+<label for="min_length">Read length window</label>
+<span class="inline"><input type="number" id="min_length" name="min_length" value="{esc(bc.get("min_length", 100))}" min="0" style="width:7em"> to
+<input type="number" id="max_length" name="max_length" value="{esc(bc.get("max_length", 3000))}" min="0" style="width:7em"> bases</span>
+<span class="muted">The default keeps every plausible amplicon; the published protocol narrows it to 400 to 2000 for the full ITS, 100 to 700 for ITS2 alone.</span>
+<label for="min_qscore">Minimum read qscore (optional)</label><input type="number" id="min_qscore" name="min_qscore" step="0.1" min="0" style="width:7em" value="{esc(bc.get("min_qscore") if bc.get("min_qscore") is not None else "")}">
+</fieldset>"""
+        token = f'<input type="hidden" name="client_token" value="{esc(hashlib.sha1(f"{time.time()}{user["label"]}".encode()).hexdigest())}">'
+        if source is None:
+            refs = "".join(f'<option value="{esc(sha)}">{esc(name or "reference")} ({esc(sha[:12])})</option>' for sha, name in used.items())
+            return page("New run", f"""
 <form method="post" action="{mount}/new" enctype="multipart/form-data" class="card">
 <h2>New run</h2>{err}{load_line(load)}
 <label for="name">Run name (optional; names the downloads, e.g. Run150 → Run150_Summary.zip)</label><input type="text" id="name" name="name" maxlength="100">
@@ -273,17 +305,45 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
 <span class="muted">Live mode takes FASTQ that MinKNOW basecalls on the sequencing machine; the dashboard fills while sequencing continues.</span>
 <label for="input">Input</label><select id="input" name="input">
 <option value="fastq">FASTQ, basecalled on your own machine</option><option value="pod5">POD5, basecalled here (dorado on a GPU)</option></select>
-<fieldset><legend>Basecalling (POD5 input only)</legend>
-<label for="model">Dorado model</label><select id="model" name="model">{models}</select>
-<label for="min_length">Read length window</label>
-<span class="inline"><input type="number" id="min_length" name="min_length" value="{esc(bc.get("min_length", 100))}" min="0" style="width:7em"> to
-<input type="number" id="max_length" name="max_length" value="{esc(bc.get("max_length", 3000))}" min="0" style="width:7em"> bases</span>
-<span class="muted">The default keeps every plausible amplicon; the published protocol narrows it to 400 to 2000 for the full ITS, 100 to 700 for ITS2 alone.</span>
-<label for="min_qscore">Minimum read qscore (optional)</label><input type="number" id="min_qscore" name="min_qscore" step="0.1" min="0" style="width:7em">
-</fieldset>
+{basecalling}
 <label for="user_id">Submitted by</label><input type="text" id="user_id" name="user_id" value="{esc(user["label"])}">
-<input type="hidden" name="client_token" value="{esc(hashlib.sha1(f"{time.time()}{user['label']}".encode()).hexdigest())}">
+{token}
 <p><button class="primary">Create run</button> <span class="muted">The upload comes next, with the job code.</span></p>
+</form>""", user)
+
+        sid = source["id"]
+        src_sha = src.get("reference_sha256")
+        refs = (f'<option value="">the same: {esc(src.get("reference_name") or "reference")} ({esc(src_sha[:12])})</option>'
+                if src_sha else "")
+        refs += '<option value="none">none</option>'
+        refs += "".join(f'<option value="{esc(sha)}">{esc(name or "reference")} ({esc(sha[:12])})</option>'
+                        for sha, name in used.items() if sha != src_sha)
+        if pod5:
+            reads = source.get("basecalled")
+            start = f"""<label>Start at</label>
+<label class="choice"><input type="radio" name="start" value="engine"{" checked" if reads else " disabled"}> The basecalled reads: the pipeline only, with new primers, specimens, reference or settings{"" if reads else " (this run did not finish basecalling)"}</label>
+<label class="choice"><input type="radio" name="start" value="basecall"{"" if reads else " checked"}> The POD5 upload: basecalling again with the settings below, then the pipeline</label>"""
+        else:
+            start = '<input type="hidden" name="start" value="engine">'
+        name = f"{src['name']} rerun" if src.get("name") else ""
+        return page(f"Run {sid} again", f"""
+<form method="post" action="{mount}/new" enctype="multipart/form-data" class="card">
+<h2>Run <code>{esc(sid)}</code> again</h2>{err}{load_line(load)}
+<p class="muted">A new run over this run's {"POD5" if pod5 else "FASTQ"} input: nothing is uploaded. Files left empty and settings left as they are stay the same as <a href="{mount}/runs/{esc(sid)}"><code>{esc(sid)}</code></a>'s.</p>
+<input type="hidden" name="rerun_of" value="{esc(sid)}">
+{start}
+<label for="name">Run name (optional; names the downloads)</label><input type="text" id="name" name="name" maxlength="100" value="{esc(name)}">
+<label for="primers">Primers (FASTA; empty keeps the same file)</label><input type="file" id="primers" name="primers">
+<label for="specimens">Specimens (Index.txt; empty keeps the same file)</label><input type="file" id="specimens" name="specimens">
+<label for="reference">Reference database (FASTA, optional; <code>name="…"</code> headers)</label><input type="file" id="reference" name="reference">
+<label for="reference_sha256">…or</label>
+<select id="reference_sha256" name="reference_sha256">{refs}</select>
+<label for="profile">Profile</label><select id="profile" name="profile">{profiles}</select>
+<label for="min_reads">Minimum reads per specimen</label><input type="number" id="min_reads" name="min_reads" value="{esc(src.get("min_reads") or 10)}" min="1">
+{basecalling if pod5 else ""}
+<input type="hidden" name="user_id" value="{esc(source.get("user_id"))}">
+{token}
+<p><button class="primary">Start run</button> <span class="muted">It is queued at once; it belongs to <code>{esc(source.get("user_id"))}</code>, like the run it repeats.</span></p>
 </form>""", user)
 
     @app.post("/new")
@@ -292,20 +352,28 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
         if not user:
             return login_redirect()
         form = await request.form()
+        rerun_of = str(form.get("rerun_of") or "")
+        back = f"{mount}/runs/{quote(rerun_of)}/again" if rerun_of else f"{mount}/new"
         kind = str(form.get("input") or "fastq")
         mode = "live" if form.get("mode") == "live" else "batch"
-        spec = {"mode": mode, "input": kind, "profile": str(form.get("profile") or "default")}
+        if rerun_of:
+            start = "basecall" if form.get("start") == "basecall" else "engine"
+            spec = {"rerun_of": rerun_of, "start": start, "profile": str(form.get("profile") or "default")}
+            basecall = start == "basecall"
+        else:
+            spec = {"mode": mode, "input": kind, "profile": str(form.get("profile") or "default")}
+            basecall = kind == "pod5"
         if str(form.get("name") or "").strip():
             spec["name"] = str(form.get("name")).strip()
         try:
             spec["min_reads"] = int(form.get("min_reads") or 10)
-            if kind == "pod5":
+            if basecall:
                 spec["basecall"] = {"model": str(form.get("model") or "") or None,
                                     "min_length": int(form.get("min_length") or 0),
                                     "max_length": int(form.get("max_length") or 0),
                                     "min_qscore": float(form.get("min_qscore")) if form.get("min_qscore") else None}
         except ValueError:
-            return RedirectResponse(f"{mount}/new?{urlencode({'error': 'Minimum reads and the basecalling numbers must be numbers'})}",
+            return RedirectResponse(f"{back}?{urlencode({'error': 'Minimum reads and the basecalling numbers must be numbers'})}",
                                     status_code=303)
         files = {}
         for role in ("primers", "specimens", "reference"):
@@ -319,8 +387,11 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
         async with client(user["key"]) as c:
             r = await c.post("/v1/runs", data=data, files=files)
         if r.status_code != 200:
-            return RedirectResponse(f"{mount}/new?{urlencode({'error': await api_error(r)})}", status_code=303)
+            return RedirectResponse(f"{back}?{urlencode({'error': await api_error(r)})}", status_code=303)
         run = r.json()
+        if rerun_of:
+            # nothing to upload: its page shows it queued or running
+            return RedirectResponse(f"{mount}/runs/{quote(run['id'])}", status_code=303)
         return page("Run created", created_body(run), user)
 
     def created_body(run: dict) -> str:
@@ -355,10 +426,13 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
             return login_redirect(f"{mount}/runs/{quote(run_id)}")
         async with client(user["key"]) as c:
             r = await c.get(f"/v1/runs/{run_id}")
+            listed = await c.get("/v1/runs") if r.status_code == 200 else None
         if r.status_code != 200:
             return page("Run", f'<p class="error">{esc(await api_error(r))}</p>', user)
         run = r.json()
         state = run.get("state")
+        reruns = sorted((x for x in (listed.json().get("runs", []) if listed and listed.status_code == 200 else [])
+                         if (x.get("spec") or {}).get("rerun_of") == run_id), key=lambda x: x.get("created") or 0)
         active = state in ("uploading", "input_complete", "basecalling", "running", "finalizing", "sealing", "created")
         err = f'<p class="error">{esc(error)}</p>' if error else ""
         help_text = STATE_HELP.get(state, "")
@@ -366,6 +440,11 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
             help_text += ", receiving files (live)"
         rows = [("State", f'<span class="state">{esc(state)}</span> <span class="muted">{esc(help_text)}</span>'),
                 *([("Name", esc(run["spec"]["name"]))] if (run.get("spec") or {}).get("name") else []),
+                *([("Rerun of", f'<a href="{mount}/runs/{esc(run["spec"]["rerun_of"])}"><code>{esc(run["spec"]["rerun_of"])}</code></a>'
+                                f' <span class="muted">from {"basecalling" if run["spec"].get("start") == "basecall" else "the engine"}</span>')]
+                  if (run.get("spec") or {}).get("rerun_of") else []),
+                *([("Reruns", " ".join(f'<a href="{mount}/runs/{esc(x["id"])}"><code>{esc(x["id"])}</code></a>' for x in reruns))]
+                  if reruns else []),
                 ("Created", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(run.get("created", 0)))),
                 ("Submitted by", esc(run.get("user_id"))),
                 ("Spec", f"<code>{esc(json.dumps(run.get('spec') or {}))}</code>"),
@@ -415,6 +494,8 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
             actions.append(f'<form method="post" action="{mount}/runs/{esc(run_id)}/cancel" onsubmit="return confirm(\'Cancel this run? A running stage is stopped and the run fails.\')"><button>Cancel run</button></form>')
         if state == "failed" and (run.get("exit") or {}).get("stage") == "dorado":
             actions.append(f'<form method="post" action="{mount}/runs/{esc(run_id)}/retry"><button>Retry basecalling</button></form>')
+        if state in ("sealed", "failed") and run.get("manifest"):
+            actions.append(f'<a href="{mount}/runs/{esc(run_id)}/again"><button>Run again…</button></a>')
         if state not in ("running", "finalizing", "sealing", "basecalling"):
             actions.append(f'<form method="post" action="{mount}/runs/{esc(run_id)}/delete" onsubmit="return confirm(\'Delete this run and its results? The uploaded archive is kept.\')"><button>Delete run</button></form>')
         return page(f"Run {run_id}", f"""
