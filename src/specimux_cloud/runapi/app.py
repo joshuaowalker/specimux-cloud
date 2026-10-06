@@ -542,7 +542,8 @@ def build_local_service(data_dir: Path, base_url: str, dev_key: Optional[str] = 
     secret = session_secret or _local_secret(data_dir)
     config = ServiceConfig(data_dir=data_dir, base_url=base_url, session_secret=secret,
                            engine_api_url=engine_api_url, engine_extra_args=list(engine_extra_args or []),
-                           min_uploader=os.environ.get("SPECIMUX_MIN_UPLOADER") or None)
+                           min_uploader=os.environ.get("SPECIMUX_MIN_UPLOADER") or None,
+                           **_drive_settings(os.environ))
     service = RunService(
         config,
         storage=DirectoryStorage(data_dir / "storage", base_url=base_url, secret=secret),
@@ -553,6 +554,17 @@ def build_local_service(data_dir: Path, base_url: str, dev_key: Optional[str] = 
     if dev_key:
         install_dev_host(service, dev_key)
     return service
+
+
+def _drive_settings(env) -> dict:
+    """Google Drive input from SPECIMUX_DRIVE_API_KEY (and, for a test,
+    SPECIMUX_DRIVE_API_URL in place of Google's)."""
+    out = {}
+    if env.get("SPECIMUX_DRIVE_API_KEY", "unset").strip() not in ("", "unset"):   # the stack's placeholder
+        out["drive_api_key"] = env["SPECIMUX_DRIVE_API_KEY"].strip()
+    if env.get("SPECIMUX_DRIVE_API_URL"):
+        out["drive_api_url"] = env["SPECIMUX_DRIVE_API_URL"]
+    return out
 
 
 def install_dev_host(service: RunService, dev_key: str, host_id: str = "dev") -> None:
@@ -581,7 +593,8 @@ def build_aws_service(base_url: str, engine_extra_args: Optional[list] = None) -
     complexes the dorado image bakes, comma separated); SPECIMUX_STAGE_SLOTS
     (``engine=2,dorado=2``) for how many runs each stage runs at once;
     SPECIMUX_MIN_UPLOADER (unset: every uploader) for the oldest uploader
-    served. Hosts and their
+    served; for Google Drive input SPECIMUX_DRIVE_API_KEY and the copy
+    job's SPECIMUX_BATCH_QUEUE_FETCH and SPECIMUX_BATCH_JOBDEF_FETCH. Hosts and their
     keys live in the table (``specimux-cloud hosts``).
     """
     from ..backends.aws import BatchLauncher, DynamoStore, S3Storage, SqsQueue
@@ -600,12 +613,16 @@ def build_aws_service(base_url: str, engine_extra_args: Optional[list] = None) -
            if env.get("SPECIMUX_DORADO_MODELS") else {}),
         **({"stage_slots": {**DEFAULT_STAGE_SLOTS, **parse_stage_slots(env["SPECIMUX_STAGE_SLOTS"])}}
            if env.get("SPECIMUX_STAGE_SLOTS") else {}),
+        **_drive_settings(env),
     )
     queues = {"engine": env["SPECIMUX_BATCH_QUEUE_ENGINE"]}
     jobdefs = {"engine": env["SPECIMUX_BATCH_JOBDEF_ENGINE"]}
     if env.get("SPECIMUX_BATCH_QUEUE_DORADO"):
         queues["dorado"] = env["SPECIMUX_BATCH_QUEUE_DORADO"]
         jobdefs["dorado"] = env["SPECIMUX_BATCH_JOBDEF_DORADO"]
+    if env.get("SPECIMUX_BATCH_QUEUE_FETCH"):
+        queues["fetch"] = env["SPECIMUX_BATCH_QUEUE_FETCH"]
+        jobdefs["fetch"] = env["SPECIMUX_BATCH_JOBDEF_FETCH"]
     return RunService(
         config,
         storage=S3Storage(env["SPECIMUX_BUCKET"], region=region),

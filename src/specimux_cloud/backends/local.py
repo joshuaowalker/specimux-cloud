@@ -211,7 +211,8 @@ class SubprocessLauncher:
     go to ``log_dir/<name>.log``."""
 
     DEFAULT_COMMANDS = {"engine": [sys.executable, "-m", "specimux_cloud.engine.wrapper"],
-                        "dorado": [sys.executable, "-m", "specimux_cloud.dorado.wrapper"]}
+                        "dorado": [sys.executable, "-m", "specimux_cloud.dorado.wrapper"],
+                        "fetch": [sys.executable, "-m", "specimux_cloud.fetch"]}
 
     def __init__(self, log_dir: Path, command: Optional[list[str]] = None,
                  commands: Optional[dict[str, list[str]]] = None):

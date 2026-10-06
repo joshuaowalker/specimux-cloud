@@ -286,6 +286,11 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
 <label for="min_qscore">Minimum read qscore (optional)</label><input type="number" id="min_qscore" name="min_qscore" step="0.1" min="0" style="width:7em" value="{esc(bc.get("min_qscore") if bc.get("min_qscore") is not None else "")}">
 </fieldset>"""
         token = f'<input type="hidden" name="client_token" value="{esc(hashlib.sha1(f"{time.time()}{user["label"]}".encode()).hexdigest())}">'
+        drive = ""
+        if "google_drive" in (opts.get("sources") or []):
+            drive = """<label for="drive_folder">…from a Google Drive folder instead of an upload (optional; batch only)</label>
+<input type="text" id="drive_folder" name="drive_folder" placeholder="https://drive.google.com/drive/folders/…">
+<span class="muted">The folder must be shared with <em>Anyone with the link</em>. Every file of the input kind in it and its subfolders is copied (not MinKNOW's <code>*_fail</code> folders), and the run starts once they are all here.</span>"""
         if source is None:
             refs = "".join(f'<option value="{esc(sha)}">{esc(name or "reference")} ({esc(sha[:12])})</option>' for sha, name in used.items())
             return page("New run", f"""
@@ -305,6 +310,7 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
 <span class="muted">Live mode takes FASTQ that MinKNOW basecalls on the sequencing machine; the dashboard fills while sequencing continues.</span>
 <label for="input">Input</label><select id="input" name="input">
 <option value="fastq">FASTQ, basecalled on your own machine</option><option value="pod5">POD5, basecalled here (dorado on a GPU)</option></select>
+{drive}
 {basecalling}
 <label for="user_id">Submitted by</label><input type="text" id="user_id" name="user_id" value="{esc(user["label"])}">
 {token}
@@ -363,6 +369,8 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
         else:
             spec = {"mode": mode, "input": kind, "profile": str(form.get("profile") or "default")}
             basecall = kind == "pod5"
+            if str(form.get("drive_folder") or "").strip():
+                spec["source"] = {"google_drive": str(form.get("drive_folder")).strip()}
         if str(form.get("name") or "").strip():
             spec["name"] = str(form.get("name")).strip()
         try:
@@ -389,7 +397,7 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
         if r.status_code != 200:
             return RedirectResponse(f"{back}?{urlencode({'error': await api_error(r)})}", status_code=303)
         run = r.json()
-        if rerun_of:
+        if rerun_of or spec.get("source"):
             # nothing to upload: its page shows it queued or running
             return RedirectResponse(f"{mount}/runs/{quote(run['id'])}", status_code=303)
         return page("Run created", created_body(run), user)
@@ -436,6 +444,9 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
         active = state in ("uploading", "input_complete", "basecalling", "running", "finalizing", "sealing", "created")
         err = f'<p class="error">{esc(error)}</p>' if error else ""
         help_text = STATE_HELP.get(state, "")
+        from_drive = bool((run.get("spec") or {}).get("source"))
+        if from_drive and state in ("created", "uploading"):
+            help_text = {"created": "waiting to copy from Google Drive", "uploading": "copying from Google Drive"}[state]
         if run.get("uploads_open") and state in ("running", "finalizing"):
             help_text += ", receiving files (live)"
         rows = [("State", f'<span class="state">{esc(state)}</span> <span class="muted">{esc(help_text)}</span>'),
@@ -453,8 +464,12 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
             ck = run["input_check"]
             rows.append(("Files checked", esc(f"{ck.get('specimens')} specimens, {ck.get('primers')} primers in "
                                               f"{ck.get('pools')} pool(s) (specimux {ck.get('specimux')} --check)")))
+        if run.get("drive"):
+            dr = run["drive"]
+            link = f"https://drive.google.com/drive/folders/{dr['folder']}"
+            rows.append(("Google Drive", f'<a href="{esc(link)}">folder</a>: {esc(dr["files"])} file(s), {dr["bytes"]:,} bytes'))
         if run.get("upload") and not run.get("manifest"):
-            rows.append(("Upload", esc(upload_text(run["upload"]))))
+            rows.append(("Copied" if from_drive else "Upload", esc(upload_text(run["upload"]))))
         if run.get("manifest"):
             rows.append(("Input", f"{len(run['manifest'])} file(s), {sum(m.get('size', 0) for m in run['manifest']):,} bytes"))
         if run.get("basecalling") or state == "basecalling":
@@ -467,7 +482,8 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
             rows.append(("Effective configuration", f"<code>{esc(json.dumps(run['effective_config']))}</code>"))
         if run.get("exit"):
             ex = run["exit"]
-            label = {"dorado": "Dorado exit", "upload": "Upload"}.get(ex.get("stage"), "Engine exit")
+            label = {"dorado": "Dorado exit", "upload": "Upload", "fetch": "Copy from Google Drive"}.get(
+                ex.get("stage"), "Engine exit")
             detail = [f"code {esc(ex.get('code'))}"] if ex.get("code") is not None else []
             if ex.get("errors") is not None:
                 detail.append(f"{esc(ex.get('errors'))} error(s) reported")
@@ -498,6 +514,8 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
             actions.append(f'<form method="post" action="{mount}/runs/{esc(run_id)}/cancel" onsubmit="return confirm(\'Cancel this run? A running stage is stopped and the run fails.\')"><button>Cancel run</button></form>')
         if state == "failed" and (run.get("exit") or {}).get("stage") == "dorado":
             actions.append(f'<form method="post" action="{mount}/runs/{esc(run_id)}/retry"><button>Retry basecalling</button></form>')
+        if state == "failed" and (run.get("exit") or {}).get("stage") == "fetch" and not run.get("cancel"):
+            actions.append(f'<form method="post" action="{mount}/runs/{esc(run_id)}/retry"><button>Retry the copy</button></form>')
         if state in ("sealed", "failed") and run.get("manifest"):
             actions.append(f'<a href="{mount}/runs/{esc(run_id)}/again"><button>Run again…</button></a>')
         if state not in ("running", "finalizing", "sealing", "basecalling"):

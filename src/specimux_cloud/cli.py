@@ -49,7 +49,7 @@ def _print_hosts(hosts):
 # untouched (argparse's REMAINDER refuses options before a positional)
 PASSTHROUGH = {"engine": "specimux_cloud.engine.wrapper", "dorado": "specimux_cloud.dorado.wrapper",
                "upload": "specimux_cloud.uploader.cli", "submit": "specimux_cloud.uploader.submit",
-               "run": "specimux_cloud.uploader.runctl"}
+               "run": "specimux_cloud.uploader.runctl", "fetch": "specimux_cloud.fetch"}
 
 
 def start_reconcile_loop(service, interval_s: float):
@@ -169,10 +169,16 @@ def main(argv=None) -> None:
     rc = sub.add_parser("run", help="Status, cancel or retry one run with a service key")
     rc.add_argument("rest", nargs=argparse.REMAINDER)
 
+    fe = sub.add_parser("fetch", help="The Google Drive copy job (normally launched by the run API)")
+    fe.add_argument("rest", nargs=argparse.REMAINDER)
+
     args = ap.parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level),
                         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s", datefmt="%H:%M:%S")
     log = logging.getLogger(__name__)
+    if args.log_level != "DEBUG":
+        # httpx logs every request line, and URLs can carry presigned signatures
+        logging.getLogger("httpx").setLevel(logging.WARNING)
 
     if args.command == "runapi":
         import uvicorn

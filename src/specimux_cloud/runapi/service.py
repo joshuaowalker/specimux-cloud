@@ -40,6 +40,7 @@ from specimux_suite.web.viewer import create_viewer_app
 from .. import __version__ as cloud_version
 from ..packages import DOWNLOAD_SUFFIX, PACKAGES, SEAL_SKIP_DIRS, build_zip, download_name, package_files
 from ..progress import basecall_estimate, basecall_text, upload_estimate, upload_text
+from .. import drive
 from ..backends.base import CommandQueue, ConflictError, JobSpec, Launcher, Storage, Store
 from . import auth
 from .events import IngestLog
@@ -95,7 +96,12 @@ MEMORY_MIB_PER_VCPU = 1900   # c6i/m6i have 2 or 4 GiB per vCPU; leave headroom
 LIVE_ENGINE_TIMEOUT_S = 96 * 3600
 ENGINE_STAGE = "engine"
 DORADO_STAGE = "dorado"
-DEFAULT_STAGE_SLOTS = {ENGINE_STAGE: 2, DORADO_STAGE: 2}
+# A run whose input is a Google Drive folder (spec.source.google_drive):
+# a small CPU job copies the files to the run's archive through the
+# uploader's routes, as an uploader on the lab's machine would
+FETCH_STAGE = "fetch"
+DEFAULT_STAGE_SLOTS = {ENGINE_STAGE: 2, DORADO_STAGE: 2, FETCH_STAGE: 2}
+STAGES = (FETCH_STAGE, DORADO_STAGE, ENGINE_STAGE)
 # A rerun (spec.rerun_of) is a new run over a finished run's input, starting
 # at basecalling (the uploaded POD5, new basecalling settings) or at the
 # engine (the basecalled or uploaded FASTQ). It takes the source's files
@@ -198,6 +204,10 @@ class ServiceConfig:
     # how many runs each stage runs at once (SPECIMUX_STAGE_SLOTS): a cost
     # cap, and for dorado the G-instance quota (8 vCPUs = two xlarge)
     stage_slots: dict = field(default_factory=lambda: dict(DEFAULT_STAGE_SLOTS))
+    # Google Drive input (SPECIMUX_DRIVE_API_KEY): an API key for the Drive
+    # API, which reads only publicly shared files; None turns it off
+    drive_api_key: Optional[str] = None
+    drive_api_url: str = drive.DRIVE_API
     # The oldest uploader still served (SPECIMUX_MIN_UPLOADER); None serves
     # every one. Raise it only when an old uploader truly cannot work
     # (specimux_cloud/versioning.py).
@@ -315,8 +325,9 @@ class RunView:
 
 class RunService:
     def __init__(self, config: ServiceConfig, storage: Storage, queue: CommandQueue,
-                 launcher: Launcher, store: Store):
+                 launcher: Launcher, store: Store, drive_client=None):
         self.config = config
+        self.drive_client = drive_client     # an httpx.Client for Drive (tests pass a fake)
         self.storage = storage
         self.queue = queue
         self.launcher = launcher
@@ -390,6 +401,9 @@ class RunService:
                 raise ServiceError(400, "name must not contain control or formatting characters")
         if spec.get("mode", "batch") not in ("batch", "live"):
             raise ServiceError(400, "mode must be batch or live")
+        listing = None
+        if spec.get("source") is not None:
+            spec, listing = self._drive_source(spec)
         if spec.get("input", "fastq") not in ("fastq", "pod5"):
             raise ServiceError(400, "input must be fastq or pod5")
         if spec.get("mode") == "live" and spec.get("input") == "pod5":
@@ -430,6 +444,8 @@ class RunService:
             "versions": {"suite": suite_version, "cloud": cloud_version},
             "effective_config": None,
             "input_check": {k: checked[k] for k in ("primers", "pools", "specimens", "specimux")},
+            **({"drive": {"folder": spec["source"]["google_drive"], "files": len(listing),
+                          "bytes": sum(f["size"] for f in listing)}} if listing is not None else {}),
             "ingested_files": [],
             "exit": None,
         }
@@ -438,6 +454,10 @@ class RunService:
             # a retried create: the existing run, without a secret (shown once)
             if stored["spec"].get("rerun_of") and stored["state"] == CREATED:
                 stored = self._start_rerun(stored)
+            elif stored["spec"].get("source") and stored["state"] == CREATED and listing is not None:
+                if self.storage.head(self._drive_listing_key(stored)) is None:
+                    self.storage.put(self._drive_listing_key(stored), json.dumps(listing).encode())
+                stored = self._try_launch(stored["id"]) or self.get_run(stored["id"])
             return self._public(stored)
         for role, data in files.items():
             self.storage.put(f"{self.run_prefix(run)}/input/{role}", data)
@@ -448,6 +468,10 @@ class RunService:
         if not spec.get("archive_id"):
             self.store.put_archive({"id": run["archive_id"], "run": run_id, "host": host_id, "user_id": user_id,
                                     "input": spec.get("input", "fastq"), "created": time.time()})
+        if listing is not None:
+            # the files are copied by the fetch job, not uploaded by a person
+            self.storage.put(self._drive_listing_key(stored), json.dumps(listing).encode())
+            return self._public(self._try_launch(run_id) or self.get_run(run_id))
         if source is not None:
             # no upload: the input is the source's (no job code either)
             return self._public(self._start_rerun(stored))
@@ -497,6 +521,28 @@ class RunService:
                 "specimens": result.specimens, "specimux": specimux.__version__,
                 "problems": [{"file": roles.get(p.file, p.file), "line": p.line, "message": p.message,
                               "count": p.count} for p in result.problems]}
+
+    def _drive_source(self, spec: dict) -> tuple[dict, list[dict]]:
+        """A run whose input is a public Google Drive folder: the folder's
+        files, listed now so a bad link is refused before anything runs,
+        and the spec with the folder's id."""
+        src = spec["source"]
+        if not isinstance(src, dict) or set(src) - {"google_drive", "include_failed"} or not src.get("google_drive"):
+            raise ServiceError(400, "source must be {\"google_drive\": \"<folder link>\"}")
+        if spec.get("mode", "batch") != "batch":
+            raise ServiceError(400, "A run from Google Drive is a batch run")
+        if spec.get("archive_id") or spec.get("rerun_of") is not None:
+            raise ServiceError(400, "A run from Google Drive takes its input from the folder only")
+        try:
+            fid = drive.folder_id(str(src["google_drive"]))
+            lister = drive.DriveLister(self.config.drive_api_key, self.config.drive_api_url, self.drive_client)
+            listing = lister.list_files(fid, spec.get("input", "fastq"), bool(src.get("include_failed")))
+        except drive.DriveError as e:
+            raise ServiceError(e.status, e.message)
+        return {**spec, "source": {"google_drive": fid, **({"include_failed": True} if src.get("include_failed") else {})}}, listing
+
+    def _drive_listing_key(self, run: dict) -> str:
+        return f"{self.run_prefix(run)}/drive.json"
 
     @staticmethod
     def _rerun_reads_archive(spec: dict) -> bool:
@@ -758,7 +804,8 @@ class RunService:
 
     def delete_run(self, run_id: str, host_id: Optional[str] = None) -> None:
         run = self.get_run(run_id, host_id)
-        if run["state"] in (BASECALLING, RUNNING, FINALIZING, SEALING):
+        if run["state"] in (BASECALLING, RUNNING, FINALIZING, SEALING) or any(
+                rec.get("active") for rec in (run.get("stages") or {}).values()):
             raise ServiceError(409, "Run is active; cancel it first")
         # nothing is running: the run's own objects go, and so does the
         # upload archive it made if it never processed it (not started,
@@ -792,6 +839,8 @@ class RunService:
                     expected_state=[CREATED, UPLOADING, INPUT_COMPLETE])
             except ConflictError:
                 return self.cancel_run(run_id, host_id, reason, actor)  # it moved on: judge again
+            for _, _, job in self.active_jobs(run):
+                self.launcher.cancel(job["id"], why)       # a Drive run's copy job
             logger.info(f"Run {run_id} {why} ({state})")
             return self._public(run)
         if state in (BASECALLING, RUNNING, FINALIZING):
@@ -813,6 +862,15 @@ class RunService:
         run = self.get_run(run_id, host_id)
         if run["state"] != FAILED:
             raise ServiceError(409, f"Run is {run['state']}; only a failed run can be retried")
+        if (run.get("exit") or {}).get("stage") == FETCH_STAGE:
+            # copy from Google Drive again; files already in the archive are kept
+            def recopy(cur: dict) -> dict:
+                if cur.get("archive_deleted"):
+                    raise ServiceError(409, "The run's copied input has been deleted; start a new run")
+                return {"state": CREATED, "exit": None, "sealed": None, "cancel": None}
+            run = self.store.update_run(run_id, recopy, expected_state=[FAILED])
+            logger.info(f"Run {run_id} retried: copying from Google Drive again")
+            return self._public(self._try_launch(run_id) or run)
         if not run.get("manifest"):
             raise ServiceError(409, "The run's upload was never completed; there is no fixed input to run again")
         stage = (run.get("exit") or {}).get("stage") or ENGINE_STAGE
@@ -831,6 +889,7 @@ class RunService:
         return {"profiles": list_profiles(),
                 "modes": ["batch", "live"], "inputs": ["fastq", "pod5"],
                 "dorado_models": list(self.config.dorado_models), "basecall_defaults": dict(DEFAULT_BASECALL),
+                "sources": ["upload"] + (["google_drive"] if self.config.drive_api_key else []),
                 "versions": {"suite": suite_version, "cloud": cloud_version}}
 
     # --- authorization helpers ---
@@ -1206,6 +1265,8 @@ class RunService:
     def next_stage(run: dict) -> str:
         """The stage an input_complete run is waiting for: dorado until its
         POD5 files are basecalled, then the engine."""
+        if run["state"] in (CREATED, UPLOADING) and run["spec"].get("source"):
+            return FETCH_STAGE
         if run["spec"].get("input", "fastq") == "pod5" and run.get("basecalled") is None:
             return DORADO_STAGE
         return ENGINE_STAGE
@@ -1213,7 +1274,10 @@ class RunService:
     def _try_launch(self, run_id: str) -> Optional[dict]:
         run = self.get_run(run_id)
         try:
-            if self.next_stage(run) == DORADO_STAGE:
+            stage = self.next_stage(run)
+            if stage == FETCH_STAGE:
+                return self.launch_fetch(run_id)
+            if stage == DORADO_STAGE:
                 return self.launch_dorado(run_id)
             return self.launch_engine(run_id)
         except ServiceError as e:
@@ -1226,11 +1290,16 @@ class RunService:
         """After a stage is released: launch the oldest run waiting for it
         (each stage on its own)."""
         launched = None
-        for stage in (DORADO_STAGE, ENGINE_STAGE):
+        for stage in STAGES:
             free = self.config.slots(stage) - len(self.store.stage_holders(stage))
             if free <= 0:
                 continue
-            waiting = [r for r in self.store.list_runs(states=[INPUT_COMPLETE]) if self.next_stage(r) == stage]
+            if stage == FETCH_STAGE:
+                # a Drive run waiting for its copy job (never launched, or retried)
+                waiting = [r for r in self.store.list_runs(states=[CREATED]) if self.next_stage(r) == FETCH_STAGE
+                           and not stage_of(r, FETCH_STAGE).get("active")]
+            else:
+                waiting = [r for r in self.store.list_runs(states=[INPUT_COMPLETE]) if self.next_stage(r) == stage]
             if stage == ENGINE_STAGE:
                 # a live run that has started uploading and is waiting for its engine
                 waiting += [r for r in self.store.list_runs(states=[UPLOADING])
@@ -1271,6 +1340,16 @@ class RunService:
         return self._launch(run, DORADO_STAGE, BASECALLING,
                             expected=[INPUT_COMPLETE, BASECALLING, FAILED, INCOMPLETE],
                             updates={"basecalling": self._carried_progress(run)})
+
+    def launch_fetch(self, run_id: str) -> dict:
+        """Launch the copy job of a run from Google Drive, in a free fetch
+        slot. It uploads with a job code like any uploader; nobody else
+        holds one for this run, so each launch makes a new one."""
+        run = self.get_run(run_id)
+        secret = secrets.token_urlsafe(24)
+        return self._launch(run, FETCH_STAGE, UPLOADING, expected=[CREATED, UPLOADING],
+                            updates={"secret_hash": _hash_secret(secret)},
+                            env={"SPECIMUX_JOB_CODE": f"{run_id}.{secret}"})
 
     def _launch(self, run: dict, stage: str, state: str, expected: list, env: Optional[dict] = None,
                 updates: Optional[dict] = None, args: Optional[list] = None, vcpus: Optional[int] = None,
@@ -1365,6 +1444,19 @@ class RunService:
                   "ingest_url": f"{self.config.engine_api_url}/v1/runs/{run_id}/ingest",
                   "commands_url": f"{self.config.engine_api_url}/v1/runs/{run_id}/commands",
                   "exit_url": f"{self.config.engine_api_url}/v1/runs/{run_id}/exit"}
+        if stage == FETCH_STAGE:
+            # The copy job's side: each Drive file (a download URL carrying
+            # the API key), and what the archive already holds, so a
+            # relaunch copies only what is missing
+            listing = json.loads(self.storage.get(self._drive_listing_key(run)))
+            prefix = f"{self.archive_prefix(run)}/{run['spec'].get('input', 'fastq')}/"
+            bundle["drive"] = {
+                "api_key": self.config.drive_api_key or "",
+                "files": [{"name": f["name"], "path": f["path"], "size": f["size"], "md5": f["md5"],
+                           "url": drive.download_url(f["id"], self.config.drive_api_url)} for f in listing],
+                "archived": {o.key.rsplit("/", 1)[-1]: {"key": o.key, "size": o.size, "etag": o.etag}
+                             for o in self.storage.list(prefix)}}
+            return bundle
         if run["spec"].get("input", "fastq") == "pod5":
             # The dorado job's side: the POD5 files, where each FASTQ goes
             # (a presigned PUT; long enough for a slow file), and what an
@@ -1544,6 +1636,8 @@ class RunService:
             return self._public(run)  # already judged (a reconcile pass, or a retried report)
         if stage == DORADO_STAGE:
             return self._dorado_exited(run, int(generation), exit_code, log_tail)
+        if stage == FETCH_STAGE:
+            return self._fetch_exited(run, int(generation), exit_code, log_tail)
         exit_info = {"code": exit_code, "generation": generation, "log_tail": log_tail[-4000:],
                      "reported": time.time()}
         if (run.get("cancel") or {}).get("reason"):
@@ -1623,6 +1717,38 @@ class RunService:
         run = self._try_launch(run_id) or run
         self._launch_next_queued_quietly()
         return self._public(run)
+
+    def _fetch_exited(self, run: dict, generation: int, exit_code: int, log_tail: str = "",
+                      reason: str = "") -> dict:
+        """The copy job is over. On success it has already completed the
+        upload (the run moved on to its next stage); a job that ended with
+        the upload still open failed, whatever its exit code, and fails the
+        run, keeping what it copied for a retry."""
+        run_id = run["id"]
+        current = self.get_run(run_id)
+        if not reason:
+            # the job's last error line says what went wrong, for the run page
+            errors = [line.split(" ERROR ", 1)[1].strip() for line in log_tail.splitlines() if " ERROR " in line]
+            reason = errors[-1] if errors else ""
+        if current["state"] in (CREATED, UPLOADING):
+            if exit_code == 0:
+                exit_code, reason = 1, reason or "the copy job ended without completing the upload"
+            exit_info = {"code": exit_code, "generation": generation, "log_tail": log_tail[-4000:],
+                         "reported": time.time(), "stage": FETCH_STAGE,
+                         "reason": (current.get("cancel") or {}).get("reason") or reason
+                                   or "copying from Google Drive failed"}
+            try:
+                self.store.update_run(run_id, {"state": FAILED, "exit": exit_info,
+                                               "sealed": {"error": "copying from Google Drive failed",
+                                                          "output_files": 0}},
+                                      expected_state=[CREATED, UPLOADING])
+                logger.warning(f"Run {run_id} copy from Google Drive (generation {generation}) failed: "
+                               f"{exit_info['reason']}")
+            except ConflictError:
+                pass  # completed, cancelled or expired meanwhile
+        self._end_stage(run_id, FETCH_STAGE, generation)
+        self._launch_next_queued_quietly()
+        return self._public(self.get_run(run_id))
 
     def _launch_next_queued_quietly(self) -> None:
         try:
@@ -1772,9 +1898,13 @@ class RunService:
             return hit[1]
         run = self.get_run(run_id)
         state, status = run["state"], None
-        if state in (CREATED, UPLOADING):
+        drive_run = bool(run["spec"].get("source"))
+        if state == CREATED and drive_run and not stage_of(run, FETCH_STAGE).get("active"):
+            status = {"text": "Waiting to copy the input from Google Drive", "progress": None}
+        elif state in (CREATED, UPLOADING):
             up = self._upload_received(run)
-            status = {"text": "Uploading: " + upload_text(up, now), "progress": upload_estimate(up, now)["fraction"]}
+            status = {"text": ("Copying from Google Drive: " if drive_run else "Uploading: ") + upload_text(up, now),
+                      "progress": upload_estimate(up, now)["fraction"]}
         elif state == INPUT_COMPLETE:
             status = {"text": "Upload complete; waiting for a machine", "progress": None}
         elif state == BASECALLING:
@@ -2001,7 +2131,7 @@ class RunService:
             if handle is not None:
                 self.store.resolve_intent(intent["id"], {"job_id": handle.id, "adopted": True})
                 run = self.store.get_run(intent["run_id"])
-                kind = "dorado" if intent["kind"] == "launch-dorado" else "engine"
+                kind = intent["kind"].removeprefix("launch-")
                 if run:
                     jobs = dict(run.get("jobs", {}))
                     jobs.setdefault(handle.name, {"id": handle.id, "kind": kind,
@@ -2030,7 +2160,8 @@ class RunService:
                         logger.warning(f"Relaunch of {run['id']} refused: {e.message}")
         # every stage's job believed active: one that ended without an exit
         # report is judged here, through the same conditional paths
-        for run in self.store.list_runs(states=[UPLOADING, INPUT_COMPLETE, BASECALLING, RUNNING, FINALIZING]):
+        for run in self.store.list_runs(states=[CREATED, UPLOADING, INPUT_COMPLETE, BASECALLING, RUNNING, FINALIZING,
+                                                FAILED, INCOMPLETE]):
             for stage, generation, job in self.active_jobs(run):
                 status = self.launcher.describe(job["id"])
                 if not status.terminal:
@@ -2040,6 +2171,9 @@ class RunService:
                     # judged by what it delivered
                     self._dorado_exited(run, generation, code, reason=status.reason or "no exit report")
                     failed += 1 if code else 0
+                    continue
+                if stage == FETCH_STAGE:
+                    self._fetch_exited(run, generation, code, reason=status.reason or "no exit report")
                     continue
                 try:
                     self.store.update_run(run["id"], {

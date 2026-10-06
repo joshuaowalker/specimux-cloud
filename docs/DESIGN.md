@@ -257,6 +257,32 @@ reconcile finishes. Retry stays what it is: the same run's failed stage
 again with the same settings. The console's **Run again…** is a form
 filled in with the source's settings; both run pages link to each other.
 
+**Input from Google Drive.** A batch run may name a public Drive folder
+instead of an upload: `spec.source: {"google_drive": "<folder link>"}`
+(`include_failed` to keep MinKNOW's `*_fail` folders). The run API
+reduces the link to a folder id (it never fetches a user's URL), lists
+the folder and its subfolders through the Drive API with the
+deployment's API key (`SPECIMUX_DRIVE_API_KEY`, Secrets Manager; it
+reads only files shared with anyone who has the link) and refuses at
+creation what can't work: not a folder, not public, no files of the
+input kind, two files of one name (the archive is flat), a file over
+the 5 GB a presigned PUT takes. The listing is stored as
+`runs/<user>/<run>/drive.json`, the counts on the record. Then a `fetch`
+stage job (one vCPU on the engine's CPU queue, the run API's image,
+`specimux-cloud fetch`; two slots) copies the files: it is an uploader
+whose folder is in Drive, holding a job code the run API makes for each
+launch, streaming each file from Drive straight into its presigned PUT
+(nothing on disk), checking Drive's MD5, reporting progress through the
+upload routes, and completing the upload, which starts basecalling or
+the engine as for any upload. A relaunch skips the files the archive
+already holds with Drive's MD5 as their ETag. A file Drive refuses
+(`downloadQuotaExceeded`, unshared since) fails the run with the reason
+from the job's log; the run page offers **Retry the copy**. A run
+waiting for a fetch slot stays `created`; the dashboard banner says
+"Copying from Google Drive". The key goes in the `X-Goog-Api-Key`
+header, never in a URL (request logs and errors can't carry it), and
+reaches the job only in its bundle.
+
 **Abandoned uploads.** The two-minute reconcile ends a run with no upload
 request for 24 hours, or created and never uploaded to within 7 days (a
 lab may create a run days before sequencing ends), as `incomplete` with

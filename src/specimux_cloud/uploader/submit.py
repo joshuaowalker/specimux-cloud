@@ -25,6 +25,10 @@ basecalling options given. Files and settings not given are the source
 run's; ``--no-reference`` leaves its reference out.
 
     specimux-cloud submit --run-api URL --rerun-of r7503b970 --primers fixed.fasta
+
+``--drive-folder LINK`` takes the input from a Google Drive folder shared
+with "Anyone with the link" instead of local files: the service copies
+it (``--input`` says which files, default pod5).
 """
 
 import argparse
@@ -68,6 +72,9 @@ def run(argv: Optional[list[str]] = None) -> int:
                     help="Run a finished run again over its input (nothing is uploaded)")
     ap.add_argument("--start", choices=["engine", "basecall"], default="engine",
                     help="With --rerun-of: where the new run starts (default: the engine)")
+    ap.add_argument("--drive-folder", default=None, metavar="LINK",
+                    help="Copy the input from this Google Drive folder (shared with anyone with the link) "
+                         "instead of uploading local files")
     ap.add_argument("--no-reference", action="store_true",
                     help="With --rerun-of: leave out the source run's reference")
     ap.add_argument("--name", default=None,
@@ -111,6 +118,13 @@ def run(argv: Optional[list[str]] = None) -> int:
             if value is not None:
                 spec[field] = value
         kind = "pod5" if args.start == "basecall" else None
+    elif args.drive_folder:
+        if args.inputs or args.live or not args.primers or not args.specimens:
+            ap.error("--drive-folder takes --primers and --specimens, and no input files or --live")
+        kind = args.input or "pod5"
+        spec = {"mode": "batch", "input": kind, "profile": args.profile or "default",
+                "min_reads": 10 if args.min_reads is None else args.min_reads,
+                "source": {"google_drive": args.drive_folder}}
     else:
         if not args.inputs or not args.primers or not args.specimens:
             ap.error("the input files, --primers and --specimens are required (except with --rerun-of)")
@@ -163,6 +177,10 @@ def run(argv: Optional[list[str]] = None) -> int:
     if args.rerun_of:
         print(f"run {rid} is a rerun of {args.rerun_of} from {'basecalling' if args.start == 'basecall' else 'the engine'}: "
               f"{run['state']}", flush=True)
+        return wait_for_results(base, key, rid, args.results) if args.wait else 0
+    if args.drive_folder:
+        d = run.get("drive") or {}
+        print(f"run {rid}: copying {d.get('files')} file(s), {d.get('bytes', 0):,} bytes, from Google Drive", flush=True)
         return wait_for_results(base, key, rid, args.results) if args.wait else 0
     code = run["job_code"]
 

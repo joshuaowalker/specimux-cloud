@@ -10,15 +10,16 @@ near-zero idle bill: instances exist only while a job runs.
   at /mnt/runs in both: the mirrors of runs in progress.
 - AWS Batch on EC2 (on demand, C/M families, 0 to 64 vCPUs) with the
   engine job definition, and a GPU environment (g6, g5 or g6e xlarge) with
-  the dorado job definition for POD5 runs; the run API admits two runs per
-  stage at a time.
+  the dorado job definition for POD5 runs, and a one-vCPU copy job (the
+  run API's image) for runs from Google Drive; the run API admits two runs
+  per stage at a time.
 - The run API on ECS Fargate (0.5 vCPU, 1 GB), reached by engine jobs
   through a Cloud Map name inside the VPC and from the internet only
   through an application load balancer with an ACM certificate at
   runs.<domain> (-c domain=; without one it is reachable only inside the
   VPC).
-- ECR repositories for the three images; the session secret in Secrets
-  Manager.
+- ECR repositories for the three images; the session secret and the
+  Google Drive API key in Secrets Manager.
 """
 
 import aws_cdk as cdk
@@ -114,6 +115,12 @@ class SpecimuxCloudStack(cdk.Stack):
         session_secret = secrets.Secret(self, "SessionSecret", description="specimux-cloud session secret",
                                         generate_secret_string=secrets.SecretStringGenerator(
                                             exclude_punctuation=True, password_length=64))
+        # A Google API key for the Drive API (Google Drive input), restricted
+        # to that API; it reads only publicly shared files. Created as
+        # "unset" (Drive input off); the operator puts the key in with
+        # `aws secretsmanager put-secret-value`, and later deploys leave it.
+        drive_key = secrets.Secret(self, "DriveApiKey", description="specimux-cloud Google Drive API key",
+                                   secret_string_value=cdk.SecretValue.unsafe_plain_text("unset"))
 
         # --- Batch: the engine stage ---
         batch_sg = ec2.SecurityGroup(self, "BatchSg", vpc=vpc, description="Batch compute instances")
@@ -197,6 +204,24 @@ class SpecimuxCloudStack(cdk.Stack):
             self, "DoradoJobDef", container=dorado_container,
             timeout=cdk.Duration.hours(8), retry_attempts=2, retry_strategies=retry_rules,
         )
+        # --- Batch: the copy job of a run from Google Drive ---
+        # The run API's image (it carries specimux-cloud) on the engine's
+        # CPU queue: one vCPU streams Drive to S3, packed beside whatever runs.
+        fetch_role = iam.Role(self, "FetchJobRole", assumed_by=iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
+                              description="The Drive copy job's role; it uploads over presigned URLs")
+        fetch_container = batch.EcsEc2ContainerDefinition(
+            self, "FetchContainer",
+            image=ecs.ContainerImage.from_ecr_repository(runapi_repo, "latest"),
+            cpu=1, memory=cdk.Size.gibibytes(2), job_role=fetch_role,
+            command=["specimux-cloud", "fetch"],
+            logging=ecs.LogDrivers.aws_logs(stream_prefix="fetch",
+                                            log_retention=logs.RetentionDays.ONE_MONTH),
+        )
+        fetch_jobdef = batch.EcsJobDefinition(
+            self, "FetchJobDef", container=fetch_container,
+            timeout=cdk.Duration.hours(12), retry_attempts=2, retry_strategies=retry_rules,
+        )
+
         # The model complexes the dorado image bakes (docker/dorado.Dockerfile
         # DORADO_MODELS); the first is the default a POD5 run gets
         dorado_models = "sup@v5.0.0,sup@v5.2.0,hac@v6.0.0"
@@ -235,11 +260,14 @@ class SpecimuxCloudStack(cdk.Stack):
                 "SPECIMUX_BATCH_JOBDEF_ENGINE": engine_jobdef.job_definition_name,
                 "SPECIMUX_BATCH_QUEUE_DORADO": dorado_queue.job_queue_arn,
                 "SPECIMUX_BATCH_JOBDEF_DORADO": dorado_jobdef.job_definition_name,
+                "SPECIMUX_BATCH_QUEUE_FETCH": engine_queue.job_queue_arn,
+                "SPECIMUX_BATCH_JOBDEF_FETCH": fetch_jobdef.job_definition_name,
                 "SPECIMUX_DORADO_MODELS": dorado_models,
                 "SPECIMUX_WORK_ROOT": WORK_ROOT,
                 "SPECIMUX_ENGINE_API_URL": f"http://runapi.specimux.local:{RUNAPI_PORT}",
             },
-            secrets={"SPECIMUX_SESSION_SECRET": ecs.Secret.from_secrets_manager(session_secret)},
+            secrets={"SPECIMUX_SESSION_SECRET": ecs.Secret.from_secrets_manager(session_secret),
+                     "SPECIMUX_DRIVE_API_KEY": ecs.Secret.from_secrets_manager(drive_key)},
             port_mappings=[ecs.PortMapping(container_port=RUNAPI_PORT)],
         )
         container.add_mount_points(ecs.MountPoint(container_path=WORK_ROOT, source_volume="runs", read_only=False))
@@ -342,3 +370,4 @@ class SpecimuxCloudStack(cdk.Stack):
         cdk.CfnOutput(self, "ServiceName", value=service.service_name)
         cdk.CfnOutput(self, "EngineJobQueue", value=engine_queue.job_queue_arn)
         cdk.CfnOutput(self, "DoradoJobQueue", value=dorado_queue.job_queue_arn)
+        cdk.CfnOutput(self, "DriveApiKeySecret", value=drive_key.secret_name)

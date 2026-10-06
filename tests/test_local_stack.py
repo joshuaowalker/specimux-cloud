@@ -416,3 +416,40 @@ def test_reruns_from_the_engine_and_from_basecalling(stack, tmp_path, monkeypatc
     assert second["spec"]["basecall"]["min_length"] == 1 and second["spec"]["basecall"]["max_length"] == 2000
     assert second["state"] == "sealed" and second["basecalling"]["reads_out"] == 35
     assert s1_reads(second["id"]) == 35
+
+
+def test_a_pod5_run_from_a_google_drive_folder(stack, tmp_path, monkeypatch):
+    """submit --drive-folder against a fake Drive: the copy job (a real
+    subprocess) streams the files into the archive, then basecalling and
+    the engine run as for an upload."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from fake_drive import FakeDrive
+    from specimux_cloud.uploader.submit import run as submit
+    from specimux_suite.web.viewer import serve_in_thread
+    monkeypatch.setenv("SPECIMUX_DORADO_DEVICE", "cpu")
+    base, service = stack
+    fake = FakeDrive(page_size=1000)
+    port = _free_port()
+    serve_in_thread(fake.app, "127.0.0.1", port)
+    service.config.drive_api_key = fake.key
+    service.config.drive_api_url = f"http://127.0.0.1:{port}/drive/v3"
+    _wait(lambda: _up(f"http://127.0.0.1:{port}/drive/v3/files/x") or True, 10, "fake Drive")
+    reads = "".join(f"@r{i}\n{'ACGTACGTAC' * 50}\n+\n{'I' * 500}\n" for i in range(20))
+    fake.folder("RUNFOLDER0001", "run")
+    fake.file("FILEA0000001", "one.pod5", reads.encode(), "RUNFOLDER0001")
+    fake.file("FILEB0000001", "two.pod5", reads.encode(), "RUNFOLDER0001")
+    (tmp_path / "primers.fasta").write_bytes(b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n")
+    (tmp_path / "Index.txt").write_bytes(b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\n")
+    argv = ["--run-api", base, "--service-key", KEY, "--primers", str(tmp_path / "primers.fasta"),
+            "--specimens", str(tmp_path / "Index.txt"), "--min-reads", "5", "--user", "u1",
+            "--drive-folder", "https://drive.google.com/drive/folders/RUNFOLDER0001",
+            "--wait", "--results", str(tmp_path / "results")]
+    assert submit(argv) == 0
+    run = sorted(service.store.list_runs(host="dev"), key=lambda r: r["created"])[-1]
+    assert run["state"] == "sealed" and run["drive"]["files"] == 2
+    assert run["basecalling"]["reads_out"] == 40 and len(run["manifest"]) == 2
+    assert sorted(fake.downloads) == ["FILEA0000001", "FILEB0000001"]
+    assert (tmp_path / "data" / "logs" / f"{run['id']}-fetch-1.log").exists()
+    log = (tmp_path / "data" / "logs" / f"{run['id']}-fetch-1.log").read_text()
+    assert "Copied 2 file(s)" in log and fake.key not in log           # the key never reaches the log

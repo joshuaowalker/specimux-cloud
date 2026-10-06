@@ -147,7 +147,13 @@ chat and git repositories.
    has **Upload is complete**, **Cancel** (stops a run at whatever stage
    it is in) and **Retry** (runs a failed run's failed stage again;
    basecalling skips the files it already delivered).
-5. **Run again…** on a finished run starts a new run over its input,
+5. Instead of uploading, the form takes a **Google Drive folder link**
+   (when the deployment has Drive set up): a folder shared with *Anyone
+   with the link*, e.g. where MinKNOW's output was copied. The service
+   lists it at once (every file of the input kind, in subfolders too,
+   not MinKNOW's `*_fail` folders), refuses a link it can't read, and
+   copies the files itself; the run page shows the copy like an upload.
+6. **Run again…** on a finished run starts a new run over its input,
    with nothing uploaded: from the basecalled reads (the pipeline only,
    e.g. with corrected primers or specimens, another reference or other
    settings) or, for a POD5 run, from basecalling with new basecalling
@@ -186,7 +192,9 @@ POD5 input is detected from the files; `--model`, `--min-length`,
 uploader keeps watching. The service keeps each reference database once,
 by its SHA-256, so `submit` sends a reference only the first time your
 host uses it (another host's copy is never lent: each host sends a
-reference once itself). A finished run runs again with `--rerun-of <run id>` and no input files
+reference once itself). `--drive-folder <link>` takes the input from a Google Drive folder
+instead of local files (POD5 unless `--input fastq`).
+A finished run runs again with `--rerun-of <run id>` and no input files
 (`--start basecall` for basecalling again; files and settings not given
 are the source run's, `--no-reference` leaves its reference out):
 
@@ -233,8 +241,8 @@ side of it against any deployment. The API is under "The run API" in
   both at zero instances when idle, two runs at a time on each;
 - the run API on Fargate behind an application load balancer at
   `https://runs.<domain>`, with an ACM certificate;
-- ECR repositories for the three images, and the session secret in
-  Secrets Manager.
+- ECR repositories for the three images, and the session secret and the
+  Google Drive API key in Secrets Manager.
 
 Idle cost is the Fargate task, the load balancer and storage, about $1.50
 a day; instances exist only while a run executes.
@@ -270,6 +278,18 @@ as the latest. Keep `/v1` backward compatible (see `runapi/app.py` and
 docs/DESIGN.md, "Contracts and versioning"); if an old uploader truly
 cannot be served any more, set `SPECIMUX_MIN_UPLOADER` on the run API and
 it refuses older uploaders with the command to upgrade.
+
+**Google Drive input** needs a Google API key: in a Google Cloud project,
+enable the Google Drive API and create an API key restricted to it (no
+application restriction: jobs reach Google from changing addresses; no
+billing account is needed). It reads only files shared with anyone who
+has the link. The stack creates the secret as `unset` (Drive input off);
+put the key in and roll the run API:
+
+```bash
+SECRET=$(jq -r '."specimux-cloud".DriveApiKeySecret' infra/cdk-outputs.json)
+aws secretsmanager put-secret-value --secret-id $SECRET --secret-string '<key>'
+```
 
 Dorado models are baked into the dorado image (`DORADO_MODELS` in
 `docker/dorado.Dockerfile`), and the model names the run API offers are
