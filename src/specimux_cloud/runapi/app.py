@@ -406,7 +406,18 @@ def create_app(service: RunService, console: bool = True) -> FastAPI:
         if not isinstance(body, dict) or "generation" not in body:
             raise ServiceError(400, "A progress report is a JSON object with the generation")
         return await run_in_threadpool(service.record_basecall_progress, run_id, int(body["generation"]),
-                                       body.get("file") or "", body.get("reads"), body.get("estimate"))
+                                       body.get("file") or "", body.get("reads"), body.get("estimate"),
+                                       int(body.get("worker") or 0))
+
+    @app.post("/v1/runs/{run_id}/basecall-claim")
+    async def basecall_claim(run_id: str, request: Request, job: dict = Depends(dorado_job)):
+        """A basecalling worker's next POD5 file (``{"done": true}`` when
+        none is left), with fresh URLs for it and its FASTQ."""
+        body = await request.json()
+        if not isinstance(body, dict) or "generation" not in body:
+            raise ServiceError(400, "A claim is a JSON object with the generation and the worker")
+        return await run_in_threadpool(service.claim_basecall, run_id, int(body["generation"]),
+                                       int(body.get("worker") or 0))
 
     @app.post("/v1/runs/{run_id}/basecalled")
     async def basecalled(run_id: str, request: Request, job: dict = Depends(dorado_job)):
@@ -425,7 +436,7 @@ def create_app(service: RunService, console: bool = True) -> FastAPI:
         return await run_in_threadpool(service.report_exit, run_id, int(body.get("generation", job["generation"])),
                                        int(body.get("exit_code", 1)), str(body.get("log_tail") or ""),
                                        body.get("packages") if isinstance(body.get("packages"), dict) else None,
-                                       job["stage"])
+                                       job["stage"], int(body["worker"]) if body.get("worker") is not None else None)
 
     @app.post("/v1/runs/{run_id}/package-uploads")
     async def package_uploads(run_id: str, request: Request, job: dict = Depends(engine_job)):

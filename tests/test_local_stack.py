@@ -204,9 +204,9 @@ def test_batch_pod5_end_to_end(stack, tmp_path, monkeypatch):
     snap = browser.get(f"/v1/runs/{rid}/api/state").json()
     assert snap["specimens"]["S1"]["total_reads"] == 60
     # both jobs left their logs
-    assert (tmp_path / "data" / "logs" / f"{rid}-dorado-1.log").exists()
+    assert (tmp_path / "data" / "logs" / f"{rid}-dorado-1-w0.log").exists()
     assert (tmp_path / "data" / "logs" / f"{rid}-engine-2.log").exists()
-    assert "--emit-fastq --no-trim --device cpu" in (tmp_path / "data" / "logs" / f"{rid}-dorado-1.log").read_text()
+    assert "--emit-fastq --no-trim --device cpu" in (tmp_path / "data" / "logs" / f"{rid}-dorado-1-w0.log").read_text()
 
 
 def test_pod5_run_fails_when_dorado_does(stack, tmp_path, monkeypatch):
@@ -250,7 +250,7 @@ def test_a_stopped_dorado_job_reports_its_exit(stack, tmp_path, monkeypatch):
     _wait(lambda: service.get_run(rid)["state"] == "basecalling" and service.get_run(rid).get("jobs"),
           30, "the dorado job to launch")
     time.sleep(3)  # let the wrapper get dorado going
-    job_id = service.get_run(rid)["jobs"][f"{rid}-dorado-1"]["id"]
+    job_id = service.get_run(rid)["jobs"][f"{rid}-dorado-1-w0"]["id"]
     started = time.monotonic()
     service.launcher.cancel(job_id, "test stop")
     st = _wait(lambda: (lambda s: s if s["state"] == "failed" else None)(
@@ -312,7 +312,7 @@ def test_two_pod5_runs_at_once_share_nothing(stack, tmp_path, monkeypatch):
                        json={"manifest": [{"key": up["key"], "etag": put.headers["etag"].strip('"')}]})
         assert r.json()["state"] == "basecalling", r.text
         rids[run["id"]] = n
-    assert sorted(service.store.stage_holders("dorado")) == sorted(rids)      # both at once
+    assert sorted(service.store.stage_holders("dorado")) == sorted(f"{r}/0" for r in rids)      # both at once
     for rid, n in rids.items():
         st = _wait(lambda: (lambda s: s if s["state"] in ("sealed", "failed") and s.get("sealed") else None)(
             httpx.get(f"{base}/v1/runs/{rid}", headers=svc).json()), 180, f"run {rid} to seal")
@@ -453,3 +453,38 @@ def test_a_pod5_run_from_a_google_drive_folder(stack, tmp_path, monkeypatch):
     assert (tmp_path / "data" / "logs" / f"{run['id']}-fetch-1.log").exists()
     log = (tmp_path / "data" / "logs" / f"{run['id']}-fetch-1.log").read_text()
     assert "Copied 2 file(s)" in log and fake.key not in log           # the key never reaches the log
+
+
+def test_one_run_basecalled_on_two_gpus(stack, tmp_path, monkeypatch):
+    """Two dorado workers (real wrapper subprocesses, a stand-in dorado)
+    claim one run's four POD5 files between them; the engine then runs
+    over all four FASTQs."""
+    monkeypatch.setenv("SPECIMUX_DORADO_DEVICE", "cpu")
+    monkeypatch.setenv("SPECIMUX_SCRATCH", str(tmp_path / "scratch"))
+    monkeypatch.setenv("FAKE_DORADO_SLEEP", "2")
+    base, service = stack
+    service.config.extra_worker_min_bytes = 1
+    svc = {"X-Service-Key": KEY}
+    r = httpx.post(f"{base}/v1/runs", headers=svc,
+                   data={"spec": json.dumps({"mode": "batch", "input": "pod5", "min_reads": 5, "workers": 1}),
+                         "user_id": "u1"},
+                   files={"primers": ("primers.fasta", b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n"),
+                          "specimens": ("Index.txt", b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\n")})
+    run = r.json()
+    rid, jc = run["id"], {"Authorization": f"JobCode {run['job_code']}"}
+    names = [f"f{i}.pod5" for i in range(4)]
+    ups = httpx.post(f"{base}/v1/runs/{rid}/uploads", json={"files": names}, headers=jc).json()["uploads"]
+    for i, name in enumerate(names):
+        reads = "".join(f"@{name}-{j}\n{'ACGTACGTAC' * 50}\n+\n{'I' * 500}\n" for j in range(10 + i))
+        httpx.put(ups[name]["url"], content=reads.encode())
+    st = httpx.post(f"{base}/v1/runs/{rid}/complete", headers=jc).json()
+    assert st["state"] == "basecalling" and sorted(service.store.stage_holders("dorado")) == [f"{rid}/0", f"{rid}/1"]
+    st = _wait(lambda: (lambda s: s if s["state"] in ("sealed", "failed") and s.get("sealed") else None)(
+        httpx.get(f"{base}/v1/runs/{rid}", headers=svc).json()), 180, "run to seal")
+    assert st["state"] == "sealed", st.get("exit")
+    assert st["basecalling"]["done"] == 4 and st["basecalling"]["reads_out"] == 10 + 11 + 12 + 13
+    # both workers basecalled: each log names the files it delivered
+    logs = {w: (tmp_path / "data" / "logs" / f"{rid}-dorado-1-w{w}.log").read_text() for w in (0, 1)}
+    delivered = {w: logs[w].count(f"Worker {w} delivered") for w in (0, 1)}
+    assert delivered[0] >= 1 and delivered[1] >= 1 and sum(delivered.values()) == 4, delivered
+    assert list((tmp_path / "scratch").glob("specimux-dorado-*")) == []

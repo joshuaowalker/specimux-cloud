@@ -3,14 +3,17 @@
 
 Reads its identity from the environment (``SPECIMUX_RUN_ID``,
 ``SPECIMUX_RUN_API``, ``SPECIMUX_JOB_SECRET``, ``SPECIMUX_GENERATION``),
-fetches the job bundle from the run API, and for each POD5 file of the
-manifest that no earlier attempt delivered: downloads it, runs ``dorado
-basecaller`` with the run's model (``--no-trim``, FASTQ out, an optional
-qscore floor), keeps the reads inside the run's length window, PUTs the
-FASTQ to the presigned URL the bundle gave for it, and reports the file
-to the run API. Files are processed one at a time so scratch space stays
-at one POD5 plus its FASTQ. The exit report closes the job; the run API
-judges success by the storage listing, not by this report alone.
+fetches the job bundle from the run API, and then claims POD5 files one
+at a time until none is left: a run may have several of these jobs
+(workers, ``SPECIMUX_DORADO_WORKER``), one per GPU, and the run API hands
+each the largest file no worker has delivered or claimed. For each:
+downloads it, runs ``dorado basecaller`` with the run's model
+(``--no-trim``, FASTQ out, an optional qscore floor), keeps the reads
+inside the run's length window, PUTs the FASTQ to the presigned URL the
+claim gave for it, and reports the file to the run API. Scratch space
+stays at one POD5 plus its FASTQ. The exit report closes the worker; the
+run API judges the stage, once its last worker is over, by the storage
+listing.
 
 Standalone on purpose: only the standard library, so the dorado image is
 the dorado tarball, its models, and this module.
@@ -50,9 +53,10 @@ DEFAULT_BYTES_PER_READ = 10_000
 
 
 class RunApiClient:
-    def __init__(self, base_url: str, run_id: str, job_secret: str):
+    def __init__(self, base_url: str, run_id: str, job_secret: str, worker: int = 0):
         self.base = base_url.rstrip("/")
         self.run_id = run_id
+        self.worker = worker
         self.headers = {"X-Job-Secret": job_secret, "User-Agent": USER_AGENT,
                         "Content-Type": "application/json"}
 
@@ -66,6 +70,12 @@ class RunApiClient:
     def job_bundle(self) -> dict:
         return self._call(f"/v1/runs/{self.run_id}/job")
 
+    def claim(self, generation: int) -> dict:
+        """The next file for this worker (``{"done": true}`` when none is
+        left); the same file again while it holds one."""
+        return self._retrying(f"/v1/runs/{self.run_id}/basecall-claim",
+                              {"generation": generation, "worker": self.worker}, patience_s=600.0)
+
     def report_basecalled(self, generation: int, name: str, key: str, reads_in: int, reads_out: int) -> dict:
         return self._retrying(f"/v1/runs/{self.run_id}/basecalled",
                               {"generation": generation, "name": name, "key": key,
@@ -75,15 +85,15 @@ class RunApiClient:
         """Best effort, for the run page: never retried, never fatal."""
         try:
             self._call(f"/v1/runs/{self.run_id}/basecall-progress",
-                       {"generation": generation, "file": name, "reads": reads, "estimate": estimate},
-                       timeout=10.0)
+                       {"generation": generation, "file": name, "reads": reads, "estimate": estimate,
+                        "worker": self.worker}, timeout=10.0)
         except Exception as e:
             logger.debug(f"Progress report not delivered: {e}")
 
     def report_exit(self, generation: int, exit_code: int, log_tail: str, patience_s: float = 1800.0) -> dict:
         return self._retrying(f"/v1/runs/{self.run_id}/exit",
-                              {"generation": generation, "exit_code": exit_code, "log_tail": log_tail},
-                              patience_s=patience_s)
+                              {"generation": generation, "exit_code": exit_code, "log_tail": log_tail,
+                               "worker": self.worker}, patience_s=patience_s)
 
     def _retrying(self, path: str, body: dict, patience_s: float) -> dict:
         """POST, retrying for up to ``patience_s`` (the run API may be
@@ -250,16 +260,18 @@ def run(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--scratch", type=Path, default=Path(os.environ["SPECIMUX_SCRATCH"]) if os.environ.get("SPECIMUX_SCRATCH") else None)
     ap.add_argument("--dorado", default=os.environ.get("SPECIMUX_DORADO_BIN", "dorado"))
     ap.add_argument("--device", default=os.environ.get("SPECIMUX_DORADO_DEVICE", "cuda:all"))
+    ap.add_argument("--worker", type=int, default=int(os.environ.get("SPECIMUX_DORADO_WORKER", "0") or 0))
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(name)s: %(message)s")
     if not (args.run_id and args.run_api and args.job_secret and args.generation):
         ap.error("run id, run API, job secret and generation are required (flags or SPECIMUX_* env)")
 
-    api = RunApiClient(args.run_api, args.run_id, args.job_secret)
+    api = RunApiClient(args.run_api, args.run_id, args.job_secret, args.worker)
     # its own directory under a scratch root other jobs may share (the
     # local stack runs several on one disk): files are named by POD5, and
-    # two runs can hold the same POD5
-    scratch = (args.scratch or Path(tempfile.gettempdir())).resolve() / f"specimux-dorado-{args.run_id}-g{args.generation}"
+    # two runs (or two workers) can hold the same POD5
+    scratch = (args.scratch or Path(tempfile.gettempdir())).resolve() / \
+        f"specimux-dorado-{args.run_id}-g{args.generation}-w{args.worker}"
     shutil.rmtree(scratch, ignore_errors=True)
     scratch.mkdir(parents=True)
     log_path = scratch / "dorado.log"
@@ -272,39 +284,41 @@ def run(argv: Optional[list[str]] = None) -> int:
             raise RuntimeError(f"Run is at generation {bundle.get('generation')}, this job is {args.generation}")
         if "pod5" not in bundle:
             raise RuntimeError("This run has no POD5 input to basecall")
-        done = set(bundle.get("basecalled") or [])
-        todo = [e for e in sorted(bundle["pod5"], key=lambda e: e["name"])
-                if (e["name"][:-5] if e["name"].lower().endswith(".pod5") else e["name"]) + ".fastq" not in done]
-        logger.info(f"{len(bundle['pod5'])} POD5 files, {len(done)} already basecalled, {len(todo)} to do; "
-                    f"model {bundle.get('basecall', {}).get('model')} on {args.device}")
+        basecall = bundle.get("basecall") or {}
+        logger.info(f"Worker {args.worker}: {len(bundle['pod5'])} POD5 files in the run, "
+                    f"{len(bundle.get('basecalled') or [])} already basecalled; "
+                    f"model {basecall.get('model')} on {args.device}")
         bytes_per_read = DEFAULT_BYTES_PER_READ
-
-        def refresh() -> dict:
-            """The bundle again, for fresh presigned URLs (they last an hour
-            and the job can run for several); the last one if the run API
-            doesn't answer, which the storage request then judges."""
-            nonlocal bundle
-            try:
-                bundle = api.job_bundle()
-            except Exception as e:
-                logger.warning(f"Could not refresh the job bundle ({e}); using the URLs from before")
-            return bundle
-
+        delivered = 0
         with open(log_path, "ab") as log:
-            for i, todo_entry in enumerate(todo, 1):
-                refresh()
-                entry = next((e for e in bundle.get("pod5") or [] if e["name"] == todo_entry["name"]), todo_entry)
+            while True:
+                claim = api.claim(args.generation)
+                if claim.get("done"):
+                    break
+                entry, out_name = claim["pod5"], claim["fastq"]["name"]
+
+                def refresh(out_name=out_name) -> dict:
+                    """A fresh upload URL (presigned URLs expire, and a file
+                    can take a while): claiming again returns the same file."""
+                    try:
+                        again = api.claim(args.generation)
+                        url = again["fastq"]["url"] if not again.get("done") else claim["fastq"]["url"]
+                    except Exception as e:
+                        logger.warning(f"Could not refresh the upload URL ({e}); using the one from before")
+                        url = claim["fastq"]["url"]
+                    return {"basecall": basecall, "fastq_uploads": {out_name: {"url": url}}}
+
                 estimate = max(1, int((entry.get("size") or 0) / bytes_per_read))
                 report = (lambda reads, name=entry["name"], est=estimate:
                           api.report_progress(args.generation, name, reads, est))
-                reads_in, reads_out = basecall_file(entry, bundle, scratch, args.device, args.dorado, log, stop,
+                reads_in, reads_out = basecall_file(entry, refresh(), scratch, args.device, args.dorado, log, stop,
                                                     progress=report, refresh=refresh)
                 if reads_in and entry.get("size"):
                     bytes_per_read = entry["size"] / reads_in   # this run's own reads, for the next estimate
-                out_name = (entry["name"][:-5] if entry["name"].lower().endswith(".pod5") else entry["name"]) + ".fastq"
-                api.report_basecalled(args.generation, out_name, bundle["fastq_uploads"][out_name]["key"],
-                                      reads_in, reads_out)
-                logger.info(f"{i}/{len(todo)} delivered: {out_name}")
+                api.report_basecalled(args.generation, out_name, claim["fastq"]["key"], reads_in, reads_out)
+                delivered += 1
+                logger.info(f"Worker {args.worker} delivered {out_name} ({delivered} so far)")
+        logger.info(f"Worker {args.worker}: no file left to claim; {delivered} delivered")
     except StopRequested as e:
         # delivered files stay; a relaunch skips them
         logger.warning(f"Basecalling {e}")

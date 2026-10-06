@@ -425,7 +425,7 @@ def test_cancel_and_retry(api):
     manifest, up = _upload_pod5(client, run, ["a.pod5", "b.pod5"])
     client.post(f"/v1/runs/{rid}/complete", json={"manifest": manifest}, headers=up)
     dor = {"X-Job-Secret": launcher.specs[-1].env["SPECIMUX_JOB_SECRET"]}
-    job_id = service.get_run(rid)["jobs"][f"{rid}-dorado-1"]["id"]
+    job_id = service.get_run(rid)["jobs"][f"{rid}-dorado-1-w0"]["id"]
     # one file got done before the stop
     bundle = client.get(f"/v1/runs/{rid}/job", headers=dor).json()
     a = bundle["fastq_uploads"]["a.fastq"]
@@ -656,9 +656,9 @@ def test_pod5_run_is_basecalled_then_run(api):
     assert st["state"] == "basecalling" and st["generation"] == 1
     assert st["basecalling"] == {"files": [], "done": 0, "total": 2, "reads_in": 0, "reads_out": 0}
     spec = launcher.specs[0]
-    assert spec.kind == "dorado" and spec.name == f"{rid}-dorado-1" and spec.vcpus is None
+    assert spec.kind == "dorado" and spec.name == f"{rid}-dorado-1-w0" and spec.vcpus is None
     assert spec.env["SPECIMUX_GENERATION"] == "1" and "SPECIMUX_WORK_DIR" not in spec.env
-    assert service.store.stage_holders("dorado") == [rid] and service.store.stage_holders("engine") == []
+    assert service.store.stage_holders("dorado") == [f"{rid}/0"] and service.store.stage_holders("engine") == []
     # a second POD5 run waits for the dorado stage; a FASTQ run takes the engine at once
     other = _create_pod5(client, token="second").json()
     m2, h2 = _upload_pod5(client, other, ["c.pod5"])
@@ -685,7 +685,7 @@ def test_pod5_run_is_basecalled_then_run(api):
     r = client.post(f"/v1/runs/{rid}/basecall-progress",
                     json={"generation": 1, "file": "a.pod5", "reads": 1200, "estimate": 4000}, headers=dor)
     assert r.status_code == 200
-    cur = client.get(f"/v1/runs/{rid}", headers={"X-Service-Key": KEY}).json()["basecall_current"]
+    cur = client.get(f"/v1/runs/{rid}", headers={"X-Service-Key": KEY}).json()["basecall_current"]["0"]   # worker 0's file
     assert (cur["file"], cur["reads"], cur["estimate"]) == ("a.pod5", 1200, 4000)
     rec = client.get(f"/v1/runs/{rid}", headers={"X-Service-Key": KEY}).json()
     assert rec["basecall_attempt"]["generation"] == 1                  # the attempt's clock, from its first report
@@ -710,7 +710,7 @@ def test_pod5_run_is_basecalled_then_run(api):
     assert r.status_code == 200 and r.json() == {"done": 1, "total": 2}
     st = client.get(f"/v1/runs/{rid}", headers={"X-Service-Key": KEY}).json()
     assert st["basecalling"]["done"] == 1 and st["basecalling"]["reads_in"] == 10 and st["basecalling"]["reads_out"] == 1
-    assert st["basecall_current"] is None
+    assert st["basecall_current"] == {}
     # a second attempt of the job sees what the first delivered
     assert client.get(f"/v1/runs/{rid}/job", headers=dor).json()["basecalled"] == ["a.fastq"]
     # exit 0 with a file missing is a failure: the listing is the truth
@@ -719,8 +719,8 @@ def test_pod5_run_is_basecalled_then_run(api):
     st = r.json()
     assert st["state"] == "failed" and st["exit"]["stage"] == "dorado" and "1 of 2" in st["exit"]["reason"]
     assert st["sealed"]["error"] == "basecalling failed"
-    assert service.store.stage_holders("dorado") == [other["id"]]                  # released and handed on
-    assert launcher.specs[2].name == f"{other['id']}-dorado-1"
+    assert service.store.stage_holders("dorado") == [f"{other['id']}/0"]                  # released and handed on
+    assert launcher.specs[2].name == f"{other['id']}-dorado-1-w0"
     assert client.get(f"/v1/runs/{rid}/results.zip", headers={"X-Service-Key": KEY}).status_code in (302, 404)  # no package
 
     # --- the waiting run goes all the way ---
@@ -1397,7 +1397,7 @@ def test_a_rerun_from_basecalling_and_its_settings(api):
     assert r.status_code == 200, r.text
     run = r.json()
     rid = run["id"]
-    assert run["state"] == "basecalling" and launcher.specs[-1].name == f"{rid}-dorado-1"
+    assert run["state"] == "basecalling" and launcher.specs[-1].name == f"{rid}-dorado-1-w0"
     # the source's settings, these two replaced
     assert run["spec"]["basecall"] == {"model": "sup@v5.2.0", "min_length": 400, "max_length": 2000, "min_qscore": None}
     assert run.get("basecalled") is None

@@ -353,18 +353,43 @@ the dorado image bakes (`SPECIMUX_DORADO_MODELS` in the stack, kept in
 step with `docker/dorado.Dockerfile`), so no model downloads at run time.
 Dorado runs without barcode-kit options; specimux demultiplexes.
 
-**As built (batch POD5).** `complete` launches one dorado job in a free
-dorado slot. It takes the manifest's POD5 files one at a time (scratch
-holds one POD5 and its FASTQ), writes each FASTQ to
-`runs/<user>/<run>/fastq/<name>.fastq` over a presigned PUT and reports
-it. A job that dies leaves what it delivered, and a relaunch skips those.
-On success the run returns to `input_complete` with the FASTQs as the
-engine's reads, and the engine launches at the next generation.
+**As built (batch POD5).** `complete` launches the dorado stage: up to two
+GPU jobs (workers, `<run>-dorado-<gen>-w<n>`, sharing the stage's
+generation and secret), each in a dorado slot, which is a GPU. A worker
+claims POD5 files one at a time (`POST /basecall-claim`): the run API
+hands it the largest file no worker has delivered or claimed, inside a
+conditional write, or the one it already holds (a restarted worker gets
+its file back), with fresh presigned URLs. It writes each FASTQ to
+`runs/<user>/<run>/fastq/<name>.fastq` over a presigned PUT, reports it,
+and claims again until nothing is left, then exits and frees its GPU at
+once. Claiming instead of a split fixed in advance means a GPU that never
+arrives (G capacity is often exhausted) or runs slower only takes fewer
+files. MinKNOW writes POD5 in files of 2-3 GB, so files are the unit; a
+file is never split between GPUs.
+
+A run gets a second worker when a GPU is free, no run is queued for one
+(a queued run always takes a freed GPU first), and the work no worker
+will take is at least 1 GB (`EXTRA_WORKER_MIN_BYTES`: an instance spends
+5-8 minutes pulling the image and loading the model); at launch, and
+again whenever a GPU frees (top-up), so a run that started alone speeds
+up later. Measured on one GPU: ont98 (5 files, 10.5 GB) 45 min, Run155
+(8 files, 22.5 GB) 148 min; two GPUs should take about 60% and 50% of
+that.
+
+A worker's end (its exit report, or reconcile finding its job dead)
+frees its GPU and its claim. While others remain, the stage goes on; a
+worker still waiting for a machine when every file has been delivered
+is stopped. The last worker's end judges the stage by the storage
+listing: every FASTQ there is success, even if a worker failed on the
+way; otherwise the run fails with the failing worker's exit, and a retry
+(the next generation) claims only the files still missing. On success
+the run returns to `input_complete` with the FASTQs as the engine's
+reads, and the engine launches at the next generation.
 
 **The GPU environment** is xlarge G instances (g6, g5, g6e: one GPU,
 4 vCPUs, so two fit the default 8-vCPU G quota), zero when idle, on
-demand. Spot capacity for G instances needs a separate quota; per-file
-fan-out across Spot GPUs is the natural speedup once that exists. A third
+demand. Spot capacity for G instances needs a separate quota (refused
+once); with it, more workers per run would cost less. A third
 availability zone is in the GPU environment only, because G capacity is
 often exhausted in one or two zones.
 

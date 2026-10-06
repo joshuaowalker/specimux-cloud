@@ -39,7 +39,7 @@ from specimux_suite.web.viewer import create_viewer_app
 
 from .. import __version__ as cloud_version
 from ..packages import DOWNLOAD_SUFFIX, PACKAGES, SEAL_SKIP_DIRS, build_zip, download_name, package_files
-from ..progress import basecall_estimate, basecall_text, upload_estimate, upload_text
+from ..progress import basecall_estimate, basecall_text, fastq_name, upload_estimate, upload_text
 from .. import drive
 from ..backends.base import CommandQueue, ConflictError, JobSpec, Launcher, Storage, Store
 from . import auth
@@ -102,6 +102,15 @@ DORADO_STAGE = "dorado"
 FETCH_STAGE = "fetch"
 DEFAULT_STAGE_SLOTS = {ENGINE_STAGE: 2, DORADO_STAGE: 2, FETCH_STAGE: 2}
 STAGES = (FETCH_STAGE, DORADO_STAGE, ENGINE_STAGE)
+# Basecalling spreads over up to this many GPU jobs (workers) per run: each
+# claims the largest POD5 file no worker has taken, until none are left, so
+# a slow or missing GPU only means the others take more. A dorado slot is a
+# GPU (the G quota), and a worker holds one.
+DORADO_MAX_WORKERS = 2
+# Another worker is started only for at least this much work no worker
+# will take: a GPU instance spends 5-8 minutes pulling the dorado image and
+# loading the model before it calls a read
+EXTRA_WORKER_MIN_BYTES = 1_000_000_000
 # A rerun (spec.rerun_of) is a new run over a finished run's input, starting
 # at basecalling (the uploaded POD5, new basecalling settings) or at the
 # engine (the basecalled or uploaded FASTQ). It takes the source's files
@@ -124,6 +133,18 @@ def stage_of(run: dict, stage: str) -> dict:
     generation numbers come from one counter per run, so a job name
     (``<run>-<stage>-<generation>``) is never reused."""
     return dict((run.get("stages") or {}).get(stage) or {})
+
+
+def slot_holder(run_id: str, worker: Optional[int] = None) -> str:
+    """Who holds a stage slot: the run, or for basecalling one of its GPU
+    workers (``<run>/<n>``), since a run may hold several GPUs."""
+    return run_id if worker is None else f"{run_id}/{worker}"
+
+
+def stage_workers(run: dict, stage: str = DORADO_STAGE) -> dict:
+    """A stage's workers by index (``"0"``, ``"1"``): ``{"active",
+    "launched", "exit"}``; only basecalling has them."""
+    return dict(stage_of(run, stage).get("workers") or {})
 
 
 def engine_generation(run: dict) -> int:
@@ -204,6 +225,10 @@ class ServiceConfig:
     # how many runs each stage runs at once (SPECIMUX_STAGE_SLOTS): a cost
     # cap, and for dorado the G-instance quota (8 vCPUs = two xlarge)
     stage_slots: dict = field(default_factory=lambda: dict(DEFAULT_STAGE_SLOTS))
+    # GPU workers per basecalling run, and the least unclaimed work another
+    # one is started for (DORADO_MAX_WORKERS, EXTRA_WORKER_MIN_BYTES)
+    dorado_max_workers: int = DORADO_MAX_WORKERS
+    extra_worker_min_bytes: int = EXTRA_WORKER_MIN_BYTES
     # Google Drive input (SPECIMUX_DRIVE_API_KEY): an API key for the Drive
     # API, which reads only publicly shared files; None turns it off
     drive_api_key: Optional[str] = None
@@ -761,19 +786,18 @@ class RunService:
                                                   FINALIZING, SEALING])
             stages = {}
             for stage in (DORADO_STAGE, ENGINE_STAGE):
-                busy = [r for r in active if stage_of(r, stage).get("active")]
+                # a job per run, and for basecalling a job per GPU worker
+                jobs = [j for r in active for st, _, j in self.active_jobs(r) if st == stage]
                 waiting_for_machine = 0
-                for run in busy:
-                    job = next((j for st, _, j in self.active_jobs(run) if st == stage), None)
-                    if job:
-                        try:
-                            if self.launcher.describe(job["id"]).state == "pending":
-                                waiting_for_machine += 1
-                        except Exception:
-                            logger.warning(f"Could not describe {job['id']} for the load view", exc_info=True)
+                for job in jobs:
+                    try:
+                        if self.launcher.describe(job["id"]).state == "pending":
+                            waiting_for_machine += 1
+                    except Exception:
+                        logger.warning(f"Could not describe {job['id']} for the load view", exc_info=True)
                 stages[stage] = {
                     "slots": self.config.slots(stage),
-                    "busy": len(busy),
+                    "busy": len(jobs),
                     "waiting_for_machine": waiting_for_machine,
                     "queued": sum(1 for r in active if r["state"] == INPUT_COMPLETE and self.next_stage(r) == stage),
                 }
@@ -1292,6 +1316,11 @@ class RunService:
         launched = None
         for stage in STAGES:
             free = self.config.slots(stage) - len(self.store.stage_holders(stage))
+            if stage == DORADO_STAGE and free > 0 and not self._waiting_for(DORADO_STAGE):
+                # no run waiting: a free GPU joins a run that is basecalling
+                for run in self.store.list_runs(states=[BASECALLING]):
+                    while free > 0 and self._add_dorado_worker(run["id"]):
+                        free -= 1
             if free <= 0:
                 continue
             if stage == FETCH_STAGE:
@@ -1312,7 +1341,7 @@ class RunService:
                 got = self._try_launch(run["id"])
                 if got:
                     launched = launched or got
-                    free -= 1
+                    free = self.config.slots(stage) - len(self.store.stage_holders(stage))
         return launched
 
     # --- launching ---
@@ -1336,10 +1365,95 @@ class RunService:
         run = self.get_run(run_id)
         if run["spec"].get("input", "fastq") != "pod5":
             raise ServiceError(409, "Only a POD5 run is basecalled")
-        # a relaunch keeps what earlier attempts delivered; the job skips those files
-        return self._launch(run, DORADO_STAGE, BASECALLING,
-                            expected=[INPUT_COMPLETE, BASECALLING, FAILED, INCOMPLETE],
-                            updates={"basecalling": self._carried_progress(run)})
+        # a relaunch keeps what earlier attempts delivered; the workers claim only the rest
+        self._launch(run, DORADO_STAGE, BASECALLING, expected=[INPUT_COMPLETE, BASECALLING, FAILED, INCOMPLETE],
+                     updates={"basecalling": self._carried_progress(run), "basecall_claims": {},
+                              "basecall_current": {}}, worker=0)
+        if not self._waiting_for(DORADO_STAGE):
+            while self._add_dorado_worker(run_id):
+                pass
+        return self.get_run(run_id)
+
+    def _waiting_for(self, stage: str) -> list[dict]:
+        """Runs queued for the stage (input complete, not yet launched)."""
+        return [r for r in self.store.list_runs(states=[INPUT_COMPLETE]) if self.next_stage(r) == stage]
+
+    def _basecall_left(self, run: dict) -> tuple[list[int], int]:
+        """The sizes of the POD5 files no worker has delivered or claimed,
+        largest first, and how many active workers hold no claim (each will
+        claim one of them)."""
+        done = {f["name"] for f in (run.get("basecalling") or {}).get("files", [])}
+        claims = run.get("basecall_claims") or {}
+        sizes = sorted((m.get("size") or 0 for m in run.get("manifest") or []
+                        if fastq_name(m["key"].rsplit("/", 1)[-1]) not in done | set(claims)), reverse=True)
+        claiming = {int(c["worker"]) for c in claims.values()}
+        idle = sum(1 for w, rec in stage_workers(run).items() if rec.get("active") and int(w) not in claiming)
+        return sizes, idle
+
+    def _add_dorado_worker(self, run_id: str) -> bool:
+        """Another GPU for a run that is basecalling, when there is a free
+        dorado slot and work enough that the run's workers won't take
+        (EXTRA_WORKER_MIN_BYTES). It joins the stage's generation."""
+        run = self.get_run(run_id)
+        rec = stage_of(run, DORADO_STAGE)
+        workers = stage_workers(run)
+        if run["state"] != BASECALLING or not rec.get("active") or "workers" not in rec or _cancelled(run):
+            return False
+        if sum(1 for w in workers.values() if w.get("active")) >= self.config.dorado_max_workers:
+            return False
+        sizes, idle = self._basecall_left(run)
+        spare = sizes[idle:]
+        if not spare or sum(spare) < self.config.extra_worker_min_bytes:
+            return False
+        n = len(workers)                     # never reused: job names stay unique
+        holder = slot_holder(run_id, n)
+        if not self.store.reserve_stage(DORADO_STAGE, holder, self.config.slots(DORADO_STAGE)):
+            return False
+        generation = int(rec["generation"])
+        name = f"{run_id}-{DORADO_STAGE}-{generation}-w{n}"
+        intent = self.store.open_intent(run_id, f"launch-{DORADO_STAGE}",
+                                        {"generation": generation, "name": name, "worker": n})
+
+        def add(cur: dict) -> dict:
+            r = stage_of(cur, DORADO_STAGE)
+            if cur["state"] != BASECALLING or not r.get("active") or r.get("generation") != generation \
+                    or str(n) in (r.get("workers") or {}):
+                raise ConflictError("basecalling moved on")
+            return {"stages": {**(cur.get("stages") or {}), DORADO_STAGE: {
+                **r, "workers": {**(r.get("workers") or {}), str(n): {"active": True, "launched": time.time()}}}}}
+        try:
+            self.store.update_run(run_id, add)
+        except ConflictError:
+            self.store.resolve_intent(intent, {"error": "basecalling moved on"})
+            self.store.release_stage(DORADO_STAGE, holder)
+            return False
+        spec = JobSpec(name=name, kind=DORADO_STAGE, run_id=run_id, generation=generation,
+                       env=self._job_env(run_id, rec["job_secret"], generation, {"SPECIMUX_DORADO_WORKER": str(n)}))
+        try:
+            handle = self.launcher.find_by_name(name) or self.launcher.submit(spec)
+        except Exception as e:
+            logger.exception(f"Launch of {name} failed")
+            self.store.resolve_intent(intent, {"error": str(e)})
+            self._worker_gone(run_id, generation, n)
+            return False
+        self.store.resolve_intent(intent, {"job_id": handle.id})
+        self.store.update_run(run_id, lambda cur: {"jobs": {**(cur.get("jobs") or {}), name: {
+            "id": handle.id, "kind": DORADO_STAGE, "generation": generation, "submitted": time.time(), "worker": n}}})
+        logger.info(f"Launched {name} as job {handle.id}: another GPU for {run_id} ({sum(spare):,} bytes unclaimed)")
+        return True
+
+    def _worker_gone(self, run_id: str, generation: int, worker: int) -> None:
+        """A worker that never ran (its launch failed or was lost): inactive,
+        its slot free."""
+        def gone(cur: dict) -> dict:
+            r = stage_of(cur, DORADO_STAGE)
+            w = (r.get("workers") or {}).get(str(worker))
+            if r.get("generation") != generation or not w:
+                return {}
+            return {"stages": {**(cur.get("stages") or {}), DORADO_STAGE: {
+                **r, "workers": {**r["workers"], str(worker): {**w, "active": False}}}}}
+        self.store.update_run(run_id, gone)
+        self.store.release_stage(DORADO_STAGE, slot_holder(run_id, worker))
 
     def launch_fetch(self, run_id: str) -> dict:
         """Launch the copy job of a run from Google Drive, in a free fetch
@@ -1351,33 +1465,39 @@ class RunService:
                             updates={"secret_hash": _hash_secret(secret)},
                             env={"SPECIMUX_JOB_CODE": f"{run_id}.{secret}"})
 
+    def _job_env(self, run_id: str, job_secret: str, generation: int, env: Optional[dict] = None) -> dict:
+        return {"SPECIMUX_RUN_ID": run_id, "SPECIMUX_RUN_API": self.config.engine_api_url,
+                "SPECIMUX_JOB_SECRET": job_secret, "SPECIMUX_GENERATION": str(generation), **(env or {})}
+
     def _launch(self, run: dict, stage: str, state: str, expected: list, env: Optional[dict] = None,
                 updates: Optional[dict] = None, args: Optional[list] = None, vcpus: Optional[int] = None,
-                memory_mib: Optional[int] = None, timeout_s: Optional[int] = None) -> dict:
+                memory_mib: Optional[int] = None, timeout_s: Optional[int] = None,
+                worker: Optional[int] = None) -> dict:
         """Claim a slot of ``stage``, give the stage a new job identity (the
         run's next generation and a fresh secret), and submit the job under
         its deterministic name, as an intent first. A refused submission
         puts the run and the stage back as they were."""
         run_id = run["id"]
-        if not self.store.reserve_stage(stage, run_id, self.config.slots(stage)):
+        holder = slot_holder(run_id, worker)
+        if not self.store.reserve_stage(stage, holder, self.config.slots(stage)):
             holders = ", ".join(self.store.stage_holders(stage))
             raise ServiceError(409, f"{stage.capitalize()} stage is busy with runs {holders}")
         generation = int(run.get("generation") or 0) + 1
-        name = f"{run_id}-{stage}-{generation}"
+        name = f"{run_id}-{stage}-{generation}" + (f"-w{worker}" if worker is not None else "")
         job_secret = secrets.token_urlsafe(24)
         prior_state, prior_record = run["state"], stage_of(run, stage)
         record = {"generation": generation, "job_secret": job_secret, "active": True, "launched": time.time()}
-        intent = self.store.open_intent(run_id, f"launch-{stage}", {"generation": generation, "name": name})
+        if worker is not None:
+            record["workers"] = {str(worker): {"active": True, "launched": record["launched"]}}
+            env = {**(env or {}), "SPECIMUX_DORADO_WORKER": str(worker)}
+        intent = self.store.open_intent(run_id, f"launch-{stage}", {"generation": generation, "name": name,
+                                                                    **({"worker": worker} if worker is not None else {})})
         run = self.store.update_run(run_id, lambda cur: {
             "generation": generation, "state": state, **(updates or {}),
             "stages": {**(cur.get("stages") or {}), stage: record}}, expected_state=expected)
-        spec = JobSpec(name=name, kind=stage, run_id=run_id, generation=generation, env={
-            "SPECIMUX_RUN_ID": run_id,
-            "SPECIMUX_RUN_API": self.config.engine_api_url,
-            "SPECIMUX_JOB_SECRET": job_secret,
-            "SPECIMUX_GENERATION": str(generation),
-            **(env or {}),
-        }, args=list(args or []), vcpus=vcpus, memory_mib=memory_mib, timeout_s=timeout_s)
+        spec = JobSpec(name=name, kind=stage, run_id=run_id, generation=generation,
+                       env=self._job_env(run_id, job_secret, generation, env),
+                       args=list(args or []), vcpus=vcpus, memory_mib=memory_mib, timeout_s=timeout_s)
         try:
             handle = self.launcher.find_by_name(name) or self.launcher.submit(spec)
         except Exception as e:
@@ -1389,10 +1509,11 @@ class RunService:
                 "generation": generation - 1,
                 "state": INPUT_COMPLETE if prior_state in (RUNNING, BASECALLING) else prior_state,
                 "stages": {**(cur.get("stages") or {}), stage: prior_record}})
-            self.store.release_stage(stage, run_id)
+            self.store.release_stage(stage, holder)
             raise ServiceError(502, f"Could not launch the {stage} job: {e}")
         self.store.resolve_intent(intent, {"job_id": handle.id})
-        job = {"id": handle.id, "kind": stage, "generation": generation, "submitted": time.time()}
+        job = {"id": handle.id, "kind": stage, "generation": generation, "submitted": time.time(),
+               **({"worker": worker} if worker is not None else {})}
         run = self.store.update_run(run_id, lambda cur: {"jobs": {**(cur.get("jobs") or {}), name: job}})
         logger.info(f"Launched {name} as job {handle.id}")
         return run
@@ -1406,7 +1527,13 @@ class RunService:
                 return {}
             return {"stages": {**(cur.get("stages") or {}), stage: {**rec, "active": False}}}
         self.store.update_run(run_id, ended)
-        self.store.release_stage(stage, run_id)
+        self._release_slots(stage, run_id)
+
+    def _release_slots(self, stage: str, run_id: str) -> None:
+        """Every slot of the stage the run holds (itself, or its workers)."""
+        for holder in self.store.stage_holders(stage):
+            if holder == run_id or holder.startswith(run_id + "/"):
+                self.store.release_stage(stage, holder)
 
     def _carried_progress(self, run: dict) -> dict:
         files = [f for f in (run.get("basecalling") or {}).get("files", [])
@@ -1512,20 +1639,78 @@ class RunService:
         info = self.storage.head(key)
         if info is None:
             raise ServiceError(409, f"{key} has not been uploaded")
-        progress = dict(run.get("basecalling") or {})
-        files = [f for f in progress.get("files", []) if f["name"] != name]
-        files.append({"name": name, "key": key, "size": info.size, "etag": info.etag,
-                      "reads_in": int(reads_in), "reads_out": int(reads_out), "done": time.time(),
-                      "generation": int(generation)})
-        progress.update({"files": files, "done": len(files), "total": len(expected),
-                         "reads_in": sum(f["reads_in"] for f in files),
-                         "reads_out": sum(f["reads_out"] for f in files)})
-        self.store.update_run(run_id, {"basecalling": progress, "basecall_current": None,
-                                       **self._basecall_attempt(run, generation)})
-        return {"done": progress["done"], "total": progress["total"]}
+        record = {"name": name, "key": key, "size": info.size, "etag": info.etag,
+                  "reads_in": int(reads_in), "reads_out": int(reads_out), "done": time.time(),
+                  "generation": int(generation)}
+        out = {}
+
+        def delivered(cur: dict) -> dict:
+            # inside the write: two workers deliver at once
+            progress = dict(cur.get("basecalling") or {})
+            files = [f for f in progress.get("files", []) if f["name"] != name] + [record]
+            progress.update({"files": files, "done": len(files), "total": len(expected),
+                             "reads_in": sum(f["reads_in"] for f in files),
+                             "reads_out": sum(f["reads_out"] for f in files)})
+            # whichever worker was reporting on this file is done with it
+            current = {w: r for w, r in self._currents(cur).items() if fastq_name(r.get("file") or "") != name}
+            out.update(done=progress["done"], total=progress["total"])
+            return {"basecalling": progress, "basecall_current": current,
+                    "basecall_claims": {n: c for n, c in (cur.get("basecall_claims") or {}).items() if n != name},
+                    **self._basecall_attempt(cur, generation)}
+        self.store.update_run(run_id, delivered)
+        return out
+
+    @staticmethod
+    def _currents(run: dict) -> dict:
+        """The file each worker is basecalling, by worker (records from before
+        workers hold one report, which is worker 0's)."""
+        cur = run.get("basecall_current") or {}
+        return {"0": dict(cur)} if "file" in cur else {k: dict(v) for k, v in cur.items()}
+
+    def claim_basecall(self, run_id: str, generation: int, worker: int) -> dict:
+        """The next POD5 file for a worker: the one it already holds (a
+        retried or restarted worker), else the largest no worker has
+        delivered or claimed; ``{"done": true}`` when none is left. Claimed
+        inside the write, so two workers never get the same file. Each
+        claim carries fresh presigned URLs (a worker asks again just before
+        its upload)."""
+        run = self.check_stage_generation(run_id, DORADO_STAGE, generation)
+        entries = {fastq_name(m["key"].rsplit("/", 1)[-1]): m for m in run.get("manifest") or []}
+        chosen = {}
+
+        def claim(cur: dict) -> dict:
+            rec = stage_of(cur, DORADO_STAGE)
+            if cur["state"] != BASECALLING or rec.get("generation") != generation \
+                    or not ((rec.get("workers") or {}).get(str(worker)) or {}).get("active"):
+                raise ConflictError("not basecalling")
+            claims = dict(cur.get("basecall_claims") or {})
+            done = {f["name"] for f in (cur.get("basecalling") or {}).get("files", [])}
+            mine = sorted(n for n, c in claims.items() if int(c["worker"]) == worker and n not in done)
+            if mine:
+                chosen["name"] = mine[0]
+                return {}
+            free = [((entries[n].get("size") or 0), n) for n in entries if n not in done and n not in claims]
+            if not free:
+                chosen["name"] = None
+                return {}
+            chosen["name"] = max(free)[1]
+            claims[chosen["name"]] = {"worker": worker, "at": time.time()}
+            return {"basecall_claims": claims}
+        try:
+            run = self.store.update_run(run_id, claim)
+        except ConflictError as e:
+            raise ServiceError(409, f"Run {run_id} is not basecalling with worker {worker}: {e}")
+        if chosen["name"] is None:
+            return {"done": True}
+        e = entries[chosen["name"]]
+        key = self.basecalled_key(run, e["key"])
+        return {"done": False,
+                "pod5": {"key": e["key"], "name": e["key"].rsplit("/", 1)[-1], "etag": e.get("etag"),
+                         "size": e.get("size"), "url": self.storage.presign_get(e["key"], expires_s=4 * 3600)},
+                "fastq": {"name": chosen["name"], "key": key, "url": self.storage.presign_put(key, expires_s=8 * 3600)}}
 
     def record_basecall_progress(self, run_id: str, generation: int, name: str, reads: int,
-                                 estimate: int) -> dict:
+                                 estimate: int, worker: int = 0) -> dict:
         """The dorado job's progress on the file it is basecalling (reads
         called so far, and its estimate of the file's reads), for the run
         page."""
@@ -1534,9 +1719,9 @@ class RunService:
             raise ServiceError(409, f"Run is {run['state']}; not basecalling")
         if not isinstance(reads, int) or not isinstance(estimate, int) or reads < 0 or estimate < 0:
             raise ServiceError(400, "reads and estimate must be non-negative integers")
-        self.store.update_run(run_id, {"basecall_current": {"file": str(name)[:255], "reads": reads,
-                                                            "estimate": estimate, "at": time.time()},
-                                       **self._basecall_attempt(run, generation)})
+        report = {"file": str(name)[:255], "reads": reads, "estimate": estimate, "at": time.time()}
+        self.store.update_run(run_id, lambda cur: {"basecall_current": {**self._currents(cur), str(worker): report},
+                                                   **self._basecall_attempt(cur, generation)})
         return {"ok": True}
 
     @staticmethod
@@ -1581,10 +1766,18 @@ class RunService:
         (or launching: a job not yet recorded is left out)."""
         out = []
         for stage, rec in (run.get("stages") or {}).items():
-            if rec.get("active"):
-                job = (run.get("jobs") or {}).get(f"{run['id']}-{stage}-{rec['generation']}")
-                if job:
-                    out.append((stage, int(rec["generation"]), job))
+            if not rec.get("active"):
+                continue
+            if "workers" in rec:
+                # basecalling: one job per active worker (its job carries "worker")
+                for w, wrec in sorted(rec["workers"].items()):
+                    job = (run.get("jobs") or {}).get(f"{run['id']}-{stage}-{rec['generation']}-w{w}")
+                    if wrec.get("active") and job:
+                        out.append((stage, int(rec["generation"]), {**job, "worker": int(w)}))
+                continue
+            job = (run.get("jobs") or {}).get(f"{run['id']}-{stage}-{rec['generation']}")
+            if job:
+                out.append((stage, int(rec["generation"]), job))
         return out
 
     @staticmethod
@@ -1620,7 +1813,8 @@ class RunService:
                 pass
 
     def report_exit(self, run_id: str, generation: int, exit_code: int, log_tail: str = "",
-                    packages: Optional[dict] = None, stage: Optional[str] = None) -> dict:
+                    packages: Optional[dict] = None, stage: Optional[str] = None,
+                    worker: Optional[int] = None) -> dict:
         """The wrapper's exit report. Records the exit, releases the stage
         and hands the run to the next waiting one at once; the seal (copying
         the output dir and log to storage, building the results package)
@@ -1635,7 +1829,7 @@ class RunService:
         if not stage_of(run, stage).get("active"):
             return self._public(run)  # already judged (a reconcile pass, or a retried report)
         if stage == DORADO_STAGE:
-            return self._dorado_exited(run, int(generation), exit_code, log_tail)
+            return self._dorado_worker_exited(run, int(generation), int(worker or 0), exit_code, log_tail)
         if stage == FETCH_STAGE:
             return self._fetch_exited(run, int(generation), exit_code, log_tail)
         exit_info = {"code": exit_code, "generation": generation, "log_tail": log_tail[-4000:],
@@ -1668,6 +1862,55 @@ class RunService:
             logger.exception("Launching the next queued run failed")
         return self._public(run)
 
+    def _dorado_worker_exited(self, run: dict, generation: int, worker: int, exit_code: int,
+                              log_tail: str = "", reason: str = "") -> dict:
+        """One basecalling worker is over: its GPU and its claim are free. If
+        workers remain, the freed GPU goes to a queued run or another
+        worker, and a worker still waiting for a machine is stopped once
+        every file is delivered. The last one ends the stage, judged by what
+        was delivered: one worker failing doesn't fail the run if the
+        others delivered every file."""
+        run_id = run["id"]
+        seen = {}
+
+        def ended(cur: dict) -> dict:
+            rec = stage_of(cur, DORADO_STAGE)
+            w = (rec.get("workers") or {}).get(str(worker))
+            if rec.get("generation") != generation or not w or not w.get("active"):
+                seen["outcome"] = None
+                return {}
+            workers = {**rec["workers"], str(worker): {**w, "active": False, "exit": {
+                "code": exit_code, "reason": reason, "log_tail": log_tail[-4000:], "at": time.time()}}}
+            current = self._currents(cur)
+            current.pop(str(worker), None)
+            seen["outcome"] = "more" if any(x.get("active") for x in workers.values()) else "last"
+            return {"stages": {**(cur.get("stages") or {}), DORADO_STAGE: {**rec, "workers": workers}},
+                    "basecall_current": current,
+                    "basecall_claims": {n: c for n, c in (cur.get("basecall_claims") or {}).items()
+                                        if int(c["worker"]) != worker}}
+        run = self.store.update_run(run_id, ended)
+        if seen.get("outcome") is None:
+            return self._public(run)              # a repeated report, or judged already
+        self.store.release_stage(DORADO_STAGE, slot_holder(run_id, worker))
+        logger.info(f"Run {run_id} basecalling worker {worker} (generation {generation}) exited {exit_code}"
+                    + (f": {reason}" if reason else ""))
+        if seen["outcome"] == "more":
+            if not self._basecall_left(run)[0] and not run.get("basecall_claims"):
+                # every file delivered: a worker still waiting for a GPU isn't needed
+                for st, gen, job in self.active_jobs(run):
+                    if st == DORADO_STAGE:
+                        self.launcher.cancel(job["id"], "basecalling finished")
+                        self._dorado_worker_exited(self.get_run(run_id), gen, int(job.get("worker") or 0), 0,
+                                                   reason="not needed: every file was basecalled")
+            else:
+                self._launch_next_queued_quietly()
+            return self._public(self.get_run(run_id))
+        exits = [w.get("exit") or {} for w in stage_workers(run).values()]
+        failed = [e for e in exits if e.get("code")]
+        last = failed[-1] if failed else {"code": 0, "log_tail": log_tail, "reason": reason}
+        return self._dorado_exited(run, generation, int(last.get("code") or 0), last.get("log_tail") or "",
+                                   last.get("reason") or "")
+
     def _dorado_exited(self, run: dict, generation: int, exit_code: int, log_tail: str = "",
                        reason: str = "") -> dict:
         """The basecalling job is over. Success means every POD5 file of the
@@ -1689,6 +1932,9 @@ class RunService:
             exit_code = 1
             exit_info["reason"] = f"{len(missing)} of {len(expected)} files were not basecalled: " \
                                   + ", ".join(missing[:5])
+        elif exit_code != 0 and not missing and not _cancelled(run):
+            # a worker failed, but the others delivered every file
+            exit_code = 0
         # The state change is conditional, so an exit report and a reconcile
         # pass judging the same job apply once; the stage is released after it.
         if exit_code != 0:
@@ -2144,6 +2390,10 @@ class RunService:
                 run = self.store.get_run(intent["run_id"])
                 stage = intent["kind"].removeprefix("launch-")
                 rec = stage_of(run, stage) if run else {}
+                if run and payload.get("worker") and rec.get("generation") == payload.get("generation"):
+                    # an extra GPU worker that was never submitted: the run goes on without it
+                    self._worker_gone(run["id"], int(payload["generation"]), int(payload["worker"]))
+                    continue
                 if run and rec.get("active") and rec.get("generation") == payload.get("generation"):
                     try:
                         self.store.update_run(run["id"], lambda cur: {
@@ -2153,7 +2403,7 @@ class RunService:
                         }, expected_state=[run["state"]])
                     except ConflictError:
                         continue
-                    self.store.release_stage(stage, run["id"])
+                    self._release_slots(stage, run["id"])
                     try:
                         self._try_launch(run["id"])
                     except ServiceError as e:
@@ -2168,8 +2418,8 @@ class RunService:
                     continue
                 code = status.exit_code if status.exit_code is not None else 1
                 if stage == DORADO_STAGE:
-                    # judged by what it delivered
-                    self._dorado_exited(run, generation, code, reason=status.reason or "no exit report")
+                    self._dorado_worker_exited(self.get_run(run["id"]), generation, int(job.get("worker") or 0),
+                                               code, reason=status.reason or "no exit report")
                     failed += 1 if code else 0
                     continue
                 if stage == FETCH_STAGE:

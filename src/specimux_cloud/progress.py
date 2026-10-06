@@ -69,16 +69,21 @@ def basecall_estimate(run: dict, now: Optional[float] = None) -> Optional[dict]:
     done_bytes = sum(sizes.get(n, 0) for n in done_names if n)
     reads = sum(f.get("reads_in", 0) for f in files)
 
+    # what each worker has in hand: one report per worker (from before
+    # workers, one report)
     cur = run.get("basecall_current") or {}
-    current, current_bytes = None, 0.0
+    reports = [cur] if "file" in cur else list(cur.values())
+    in_flight, current_bytes = [], 0.0
     active = run.get("state") == "basecalling"
-    if active and cur.get("file") in sizes and cur["file"] not in done_names \
-            and now - float(cur.get("at") or 0) <= BASECALL_REPORT_FRESH_S:
-        current = cur["file"]
-        estimate = cur.get("estimate") or 0
-        if estimate:
-            current_bytes = sizes[current] * min(0.99, (cur.get("reads") or 0) / estimate)
-        reads += cur.get("reads") or 0
+    for rep in reports:
+        if active and rep.get("file") in sizes and rep["file"] not in done_names \
+                and now - float(rep.get("at") or 0) <= BASECALL_REPORT_FRESH_S:
+            in_flight.append(rep["file"])
+            estimate = rep.get("estimate") or 0
+            if estimate:
+                current_bytes += sizes[rep["file"]] * min(0.99, (rep.get("reads") or 0) / estimate)
+            reads += rep.get("reads") or 0
+    current = in_flight[0] if in_flight else None
 
     seconds_left = None
     attempt = run.get("basecall_attempt") or {}
@@ -91,7 +96,7 @@ def basecall_estimate(run: dict, now: Optional[float] = None) -> Optional[dict]:
             seconds_left = (total - done_bytes - current_bytes) / rate
     return {"fraction": (done_bytes + current_bytes) / total, "reads": reads,
             "files_done": len(done_names - {None}), "files_total": len(sizes),
-            "current": current, "seconds_left": seconds_left}
+            "current": current, "in_progress": len(in_flight), "seconds_left": seconds_left}
 
 
 def basecall_text(run: dict, now: Optional[float] = None) -> str:
@@ -114,7 +119,9 @@ def basecall_text(run: dict, now: Optional[float] = None) -> str:
     if est["seconds_left"] is not None:
         head += f", {time_left_text(est['seconds_left'])}"
     files = f"{est['files_done']} of {est['files_total']} file(s) done"
-    if est["current"]:
+    if est.get("in_progress", 0) > 1:
+        files += f", {est['in_progress']} in progress on {est['in_progress']} GPUs"
+    elif est["current"]:
         files += f", {ordinal(est['files_done'] + 1)} in progress"
     if est["reads"]:
         return f"{head} · {est['reads']:,} reads called so far ({files})"

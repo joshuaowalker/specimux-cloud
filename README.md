@@ -163,7 +163,11 @@ chat and git repositories.
 
 The runs list shows the whole service's load (runs busy and queued per
 stage, and any waiting for a machine), which explains a wait before
-basecalling or the pipeline starts. Each stage runs two runs at a time.
+basecalling or the pipeline starts. The pipeline runs two runs at a
+time; basecalling has two GPUs, which one run uses both of when it has
+the files for them (each GPU takes the largest file left, so a run of
+several POD5 files basecalls in about half the time), and which a queued
+run gets first when one frees.
 
 ### Sharing a dashboard publicly
 
@@ -238,7 +242,8 @@ side of it against any deployment. The API is under "The run API" in
   which the dashboard reads;
 - AWS Batch: a CPU environment for the pipeline (c6i, m6i, c5 or m5, up
   to 64 vCPUs) and a GPU environment for dorado (g6, g5 or g6e xlarge),
-  both at zero instances when idle, two runs at a time on each;
+  both at zero instances when idle: two pipeline runs at a time, and two
+  GPUs that one POD5 run's files are spread over;
 - the run API on Fargate behind an application load balancer at
   `https://runs.<domain>`, with an ACM certificate;
 - ECR repositories for the three images, and the session secret and the
