@@ -35,12 +35,19 @@ aws ecr get-login-password --region "$REGION" | docker login --username AWS --pa
 docker buildx inspect specimux >/dev/null 2>&1 || docker buildx create --name specimux --use >/dev/null
 docker buildx use specimux
 
-build() {  # name dockerfile uri
+build() {  # name dockerfile uri [extra buildx args]
   echo "== building $1 (suite: ${SUITE_SPEC:-Dockerfile default} @ $SHA) for linux/amd64"
+  # one manifest per image (no provenance attestation index), so the
+  # repositories' lifecycle rule can expire old builds whole
   docker buildx build --platform linux/amd64 -f "$2" ${SUITE_SPEC:+--build-arg SUITE_SPEC="$SUITE_SPEC"} \
-    -t "$3:latest" -t "$3:$SHA" --push .
+    --provenance=false -t "$3:latest" -t "$3:$SHA" "${@:4}" --push .
 }
+# The dorado image's build cache lives in its repository (:buildcache), not
+# only on this machine: rebuilding its dorado and model layers (~4 GB) from
+# a pruned local cache gives them new digests and an hour's upload.
+DORADO_CACHE=(--cache-from "type=registry,ref=${DORADO_URI:-x}:buildcache"
+              --cache-to "type=registry,ref=${DORADO_URI:-x}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true")
 [[ $which == all || $which == engine ]] && build engine docker/engine.Dockerfile "$ENGINE_URI"
 [[ $which == all || $which == runapi ]] && build runapi docker/runapi.Dockerfile "$RUNAPI_URI"
-[[ $which == dorado ]] && build dorado docker/dorado.Dockerfile "${DORADO_URI:?deploy the stack first: no DoradoRepoUri in $OUTPUTS}"
+[[ $which == dorado ]] && build dorado docker/dorado.Dockerfile "${DORADO_URI:?deploy the stack first: no DoradoRepoUri in $OUTPUTS}" "${DORADO_CACHE[@]}"
 echo "pushed: $which"

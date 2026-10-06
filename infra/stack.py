@@ -104,12 +104,18 @@ class SpecimuxCloudStack(cdk.Stack):
             posix_user=efs.PosixUser(gid="0", uid="0"))
 
         # --- images and secrets ---
+        # Every build is tagged with its commit (and the newest :latest);
+        # the ten newest tagged images stay (rollback, and dorado's
+        # :buildcache), older ones expire. Untagged images are left alone:
+        # an image index's own manifests are untagged.
+        keep_recent = [ecr.LifecycleRule(tag_status=ecr.TagStatus.TAGGED, tag_pattern_list=["*"],
+                                         max_image_count=10, description="the ten newest builds")]
         engine_repo = ecr.Repository(self, "EngineRepo", repository_name="specimux-cloud/engine",
-                                     removal_policy=cdk.RemovalPolicy.RETAIN)
+                                     removal_policy=cdk.RemovalPolicy.RETAIN, lifecycle_rules=keep_recent)
         runapi_repo = ecr.Repository(self, "RunApiRepo", repository_name="specimux-cloud/runapi",
-                                     removal_policy=cdk.RemovalPolicy.RETAIN)
+                                     removal_policy=cdk.RemovalPolicy.RETAIN, lifecycle_rules=keep_recent)
         dorado_repo = ecr.Repository(self, "DoradoRepo", repository_name="specimux-cloud/dorado",
-                                     removal_policy=cdk.RemovalPolicy.RETAIN)
+                                     removal_policy=cdk.RemovalPolicy.RETAIN, lifecycle_rules=keep_recent)
         # Signs run tokens and session cookies; hosts' service keys live in
         # the table (`specimux-cloud hosts add`), not here
         session_secret = secrets.Secret(self, "SessionSecret", description="specimux-cloud session secret",
