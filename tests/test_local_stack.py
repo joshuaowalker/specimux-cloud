@@ -72,8 +72,8 @@ def test_batch_fastq_end_to_end(stack, tmp_path):
     r = httpx.post(f"{base}/v1/runs", headers=svc,
                    data={"spec": json.dumps({"mode": "batch", "input": "fastq", "min_reads": 5, "workers": 1}),
                          "user_id": "u1", "client_token": "ct-e2e"},
-                   files={"primers": ("primers.fasta", b">ITS1F\nCTTGGTCATTTAGAGGAAGTAA\n"),
-                          "specimens": ("Index.txt", b"SampleID\tPrimerPool\nS1\tITS\nS2\tITS\n"),
+                   files={"primers": ("primers.fasta", b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n"),
+                          "specimens": ("Index.txt", b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\nS2\tITS\tAGCAATCGCGCAC\tITS1F\tACTCGCGGTGCCA\tITS4\n"),
                           "reference": ("refs.fasta", b'>REF1 name="Amanita muscaria"\nACGTACGTAC\n')})
     assert r.status_code == 200, r.text
     run = r.json()
@@ -172,8 +172,8 @@ def test_batch_pod5_end_to_end(stack, tmp_path, monkeypatch):
                    data={"spec": json.dumps({"mode": "batch", "input": "pod5", "min_reads": 5, "workers": 1,
                                              "basecall": {"model": "sup@v5.0.0", "min_length": 400, "max_length": 2000}}),
                          "user_id": "u1", "client_token": "ct-pod5"},
-                   files={"primers": ("primers.fasta", b">ITS1F\nCTTGGTCATTTAGAGGAAGTAA\n"),
-                          "specimens": ("Index.txt", b"SampleID\tPrimerPool\nS1\tITS\n")})
+                   files={"primers": ("primers.fasta", b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n"),
+                          "specimens": ("Index.txt", b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\n")})
     assert r.status_code == 200, r.text
     run = r.json()
     rid, code = run["id"], run["job_code"]
@@ -216,8 +216,8 @@ def test_pod5_run_fails_when_dorado_does(stack, tmp_path, monkeypatch):
     svc = {"X-Service-Key": KEY}
     r = httpx.post(f"{base}/v1/runs", headers=svc,
                    data={"spec": json.dumps({"mode": "batch", "input": "pod5", "min_reads": 5}), "user_id": "u1"},
-                   files={"primers": ("primers.fasta", b">ITS1F\nCTTGGTCATTTAGAGGAAGTAA\n"),
-                          "specimens": ("Index.txt", b"SampleID\tPrimerPool\nS1\tITS\n")})
+                   files={"primers": ("primers.fasta", b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n"),
+                          "specimens": ("Index.txt", b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\n")})
     run = r.json()
     rid, jc = run["id"], {"Authorization": f"JobCode {run['job_code']}"}
     r = httpx.post(f"{base}/v1/runs/{rid}/uploads", json={"files": ["one.pod5"]}, headers=jc)
@@ -240,8 +240,8 @@ def test_a_stopped_dorado_job_reports_its_exit(stack, tmp_path, monkeypatch):
     svc = {"X-Service-Key": KEY}
     r = httpx.post(f"{base}/v1/runs", headers=svc,
                    data={"spec": json.dumps({"mode": "batch", "input": "pod5", "min_reads": 5}), "user_id": "u1"},
-                   files={"primers": ("primers.fasta", b">ITS1F\nCTTGGTCATTTAGAGGAAGTAA\n"),
-                          "specimens": ("Index.txt", b"SampleID\tPrimerPool\nS1\tITS\n")})
+                   files={"primers": ("primers.fasta", b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n"),
+                          "specimens": ("Index.txt", b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\n")})
     run = r.json()
     rid, jc = run["id"], {"Authorization": f"JobCode {run['job_code']}"}
     r = httpx.post(f"{base}/v1/runs/{rid}/uploads", json={"files": ["one.pod5"]}, headers=jc)
@@ -267,8 +267,8 @@ def test_submit_sends_a_reference_only_once(stack, tmp_path, caplog):
     import logging
     from specimux_cloud.uploader.submit import run as submit
     base, service = stack
-    (tmp_path / "primers.fasta").write_bytes(b">ITS1F\nCTTGGTCATTTAGAGGAAGTAA\n")
-    (tmp_path / "Index.txt").write_bytes(b"SampleID\tPrimerPool\nS1\tITS\n")
+    (tmp_path / "primers.fasta").write_bytes(b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n")
+    (tmp_path / "Index.txt").write_bytes(b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\n")
     (tmp_path / "refs.fasta").write_bytes(b'>REF1 name="Amanita muscaria"\nACGTACGTAC\n')
     (tmp_path / "reads.fastq").write_text("".join(f"@r{i}\nACGTACGTAC\n+\nIIIIIIIIII\n" for i in range(10)))
     argv = ["--run-api", base, "--service-key", KEY, "--primers", str(tmp_path / "primers.fasta"),
@@ -301,8 +301,8 @@ def test_two_pod5_runs_at_once_share_nothing(stack, tmp_path, monkeypatch):
         r = httpx.post(f"{base}/v1/runs", headers=svc,
                        data={"spec": json.dumps({"mode": "batch", "input": "pod5", "min_reads": 5, "workers": 1}),
                              "user_id": "u1", "client_token": f"ct-two-{n}"},
-                       files={"primers": ("primers.fasta", b">ITS1F\nCTTGGTCATTTAGAGGAAGTAA\n"),
-                              "specimens": ("Index.txt", b"SampleID\tPrimerPool\nS1\tITS\n")})
+                       files={"primers": ("primers.fasta", b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n"),
+                              "specimens": ("Index.txt", b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\n")})
         run = r.json()
         jc = {"Authorization": f"JobCode {run['job_code']}"}
         up = httpx.post(f"{base}/v1/runs/{run['id']}/uploads", json={"files": ["same.pod5"]},
@@ -334,8 +334,8 @@ def test_live_fastq_end_to_end(stack, tmp_path):
     r = httpx.post(f"{base}/v1/runs", headers=svc,
                    data={"spec": json.dumps({"mode": "live", "input": "fastq", "min_reads": 5, "workers": 1}),
                          "user_id": "u1", "client_token": "ct-live"},
-                   files={"primers": ("primers.fasta", b">ITS1F\nCTTGGTCATTTAGAGGAAGTAA\n"),
-                          "specimens": ("Index.txt", b"SampleID\tPrimerPool\nS1\tITS\nS2\tITS\n")})
+                   files={"primers": ("primers.fasta", b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n"),
+                          "specimens": ("Index.txt", b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\nS2\tITS\tAGCAATCGCGCAC\tITS1F\tACTCGCGGTGCCA\tITS4\n")})
     run = r.json()
     rid, jc = run["id"], {"Authorization": f"JobCode {run['job_code']}"}
 
@@ -383,8 +383,8 @@ def test_reruns_from_the_engine_and_from_basecalling(stack, tmp_path, monkeypatc
                      data={"spec": json.dumps({"mode": "batch", "input": "pod5", "min_reads": 5, "workers": 1,
                                                "basecall": {"min_length": 400, "max_length": 2000}}),
                            "user_id": "u1"},
-                     files={"primers": ("primers.fasta", b">ITS1F\nCTTGGTCATTTAGAGGAAGTAA\n"),
-                            "specimens": ("Index.txt", b"SampleID\tPrimerPool\nS1\tITS\n")}).json()
+                     files={"primers": ("primers.fasta", b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n"),
+                            "specimens": ("Index.txt", b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\n")}).json()
     sid, jc = run["id"], {"Authorization": f"JobCode {run['job_code']}"}
     r = httpx.post(f"{base}/v1/runs/{sid}/uploads", json={"files": ["one.pod5"]}, headers=jc)
     httpx.put(r.json()["uploads"]["one.pod5"]["url"], content=(good + short).encode())
@@ -401,7 +401,7 @@ def test_reruns_from_the_engine_and_from_basecalling(stack, tmp_path, monkeypatc
         return browser.get(f"/v1/runs/{rid}/api/state").json()["specimens"]["S1"]["total_reads"]
     assert sealed(sid)["state"] == "sealed" and s1_reads(sid) == 30
 
-    (tmp_path / "Index.txt").write_bytes(b"SampleID\tPrimerPool\nS1\tITS\nS2\tITS\n")
+    (tmp_path / "Index.txt").write_bytes(b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\nS2\tITS\tAGCAATCGCGCAC\tITS1F\tACTCGCGGTGCCA\tITS4\n")
     common = ["--run-api", base, "--service-key", KEY, "--rerun-of", sid, "--user", "u1",
               "--wait", "--results", str(tmp_path / "results")]
     assert submit(common + ["--specimens", str(tmp_path / "Index.txt"), "--name", "again"]) == 0
@@ -409,7 +409,7 @@ def test_reruns_from_the_engine_and_from_basecalling(stack, tmp_path, monkeypatc
     assert first["spec"]["rerun_of"] == sid and first["state"] == "sealed" and first["generation"] == 1
     assert (tmp_path / "results" / "again_Summary.zip").exists()
     assert s1_reads(first["id"]) == 30
-    assert service.storage.get(f"runs/u1/{first['id']}/input/specimens").endswith(b"S2\tITS\n")
+    assert service.storage.get(f"runs/u1/{first['id']}/input/specimens").endswith(b"ACTCGCGGTGCCA\tITS4\n")
 
     assert submit(common + ["--start", "basecall", "--min-length", "1"]) == 0
     second = sorted(service.store.list_runs(host="dev"), key=lambda r: r["created"])[-1]

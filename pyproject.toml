@@ -25,6 +25,8 @@ keywords = ["bioinformatics", "nanopore", "sequencing", "barcoding", "cloud"]
 dependencies = [
     # The engine, the viewer app factory, the commands facade and the pages
     "specimux-suite>=0.3.7",
+    # --check: the primers and specimens files are checked at run creation
+    "specimux>=0.8.2",
     "fastapi>=0.104",
     "uvicorn>=0.24",
     "sse-starlette>=1.8",

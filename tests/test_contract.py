@@ -22,8 +22,8 @@ import time
 import httpx
 import pytest
 
-PRIMERS = b">ITS1F\nCTTGGTCATTTAGAGGAAGTAA\n"
-SPECIMENS = b"SampleID\tPrimerPool\nS1\tITS\n"
+PRIMERS = b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n"
+SPECIMENS = b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\n"
 
 
 def _free_port():

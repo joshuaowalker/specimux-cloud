@@ -135,6 +135,11 @@ chat and git repositories.
      `sup@v5.0.0` model and reads 100–3000 bases long, wide enough
      that no plausible ITS amplicon is lost (narrow it per run if you
      like).
+   The primers and specimens files are checked as specimux itself
+   checks them (`specimux --check`): a pair a run would refuse (a pool
+   without a forward or reverse primer, a primer name the primers file
+   lacks, missing columns) is refused here, with every problem listed,
+   before anything is uploaded.
 3. The console shows the job code once, with the upload command to run
    where the reads are.
 4. The run page follows the run from there: stage, basecalling

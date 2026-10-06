@@ -16,8 +16,8 @@ from specimux_cloud.runapi.service import RunService, ServiceConfig
 from test_runapi import KEY, SECRET, FakeLauncher
 
 BASE = "http://testserver"
-FILES = {"primers": ("primers.fasta", b">ITS1F\nCTTGGTCATTTAGAGGAAGTAA\n"),
-         "specimens": ("Index.txt", b"SampleID\tPrimerPool\nS1\tITS\n")}
+FILES = {"primers": ("primers.fasta", b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n"),
+         "specimens": ("Index.txt", b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\n")}
 
 
 @pytest.fixture
@@ -301,7 +301,7 @@ def test_running_a_run_again_from_its_page(stack):
     assert 'value="7" min="1"' in form and '<option value="sup@v5.2.0" selected>' in form
     assert 'value="150"' in form and '<option value="none">none</option>' in form
 
-    fixed = b">ITS1F\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4\nTCCTCCGCTTATTGATATGC\n"
+    fixed = b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n>gITS7 pool=ITS position=forward\nGTGARTCATCGARTCTTTG\n"
     r = client.post("/console/new", data={"rerun_of": sid, "start": "engine", "profile": "default", "min_reads": "5",
                                           "name": "Run155 rerun", "user_id": "user-1", "client_token": "ct-again-2",
                                           "model": "sup@v5.2.0", "min_length": "150", "max_length": "3000"},
@@ -321,3 +321,17 @@ def test_running_a_run_again_from_its_page(stack):
                                           "user_id": "user-1", "client_token": "ct-again-3", "model": "sup@v1",
                                           "min_length": "150", "max_length": "3000"})
     assert r.status_code == 303 and r.headers["location"].startswith(f"/console/runs/{sid}/again?error=")
+
+
+def test_bad_files_go_back_to_the_form_with_every_problem(stack):
+    from test_runapi import RUN155_PRIMERS, RUN155_SPECIMENS
+    client, service = stack
+    _login(client)
+    r = client.post("/console/new", data={"profile": "default", "min_reads": "7", "client_token": "ct-bad"},
+                    files={"primers": ("primers.fasta", RUN155_PRIMERS), "specimens": ("Index.txt", RUN155_SPECIMENS)})
+    assert r.status_code == 303 and r.headers["location"].startswith("/console/new?error=")
+    form = client.get(r.headers["location"]).text
+    assert "Pool ITS has no forward primers" in form and "FwPrimer &#x27;ITS1F&#x27; is not in the primers file" in form
+    rid = re.search(r"<pre>(r[0-9a-f]{8})\.", client.post("/console/new", data={
+        "profile": "default", "min_reads": "7", "client_token": "ct-good"}, files=FILES).text).group(1)
+    assert "1 specimens, 2 primers in 1 pool(s)" in client.get(f"/console/runs/{rid}").text

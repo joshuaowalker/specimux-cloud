@@ -226,6 +226,17 @@ creation (see "Basecalling stage").
 | `sealed` / `failed` | the seal finished after exit 0 / anything else |
 | `incomplete` | an upload was abandoned (below); keeps what arrived, never reports success |
 
+**The input check.** `POST /v1/runs` runs specimux's own check of the
+primers and specimens files (`specimux.check.check_inputs`, the loaders
+a demultiplexing run uses, in process) and refuses a pair a run would
+refuse, 400 with every problem (`problems: [{file, line, message,
+count}]`, `file` the role) and a readable `error`. Run155 is why: its
+primers file had no forward primer in the specimens' pool, which
+specimux reported two seconds into the engine, after a 22.5 GB upload
+and two hours of basecalling. Reruns are checked the same way, over
+the files they inherit. The run records what was checked
+(`input_check`: specimens, primers, pools, specimux version).
+
 **Reruns.** A finished run (sealed or failed) runs again as a new run:
 `POST /v1/runs` with `spec.rerun_of` and `spec.start`, `engine` (the
 default) or `basecall` (POD5 only). It never uploads: it is created

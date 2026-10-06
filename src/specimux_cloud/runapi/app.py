@@ -116,7 +116,7 @@ def create_app(service: RunService, console: bool = True) -> FastAPI:
 
     @app.exception_handler(ServiceError)
     async def _service_error(request: Request, exc: ServiceError):
-        return JSONResponse(status_code=exc.status, content={"error": exc.message})
+        return JSONResponse(status_code=exc.status, content={"error": exc.message, **exc.extra})
 
     @app.exception_handler(HTTPException)
     async def _http_error(request: Request, exc: HTTPException):

@@ -109,7 +109,7 @@ button {{ font: inherit; padding: 6px 12px; border-radius: 4px; border: 1px soli
 button.primary {{ background: var(--accent); color: #fff; border-color: var(--accent); }}
 .actions form {{ display: inline; margin-right: 8px; }}
 pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; overflow-x: auto; }}
-.error {{ color: #c0392b; }}
+.error {{ color: #c0392b; white-space: pre-line; }}
 </style></head>
 <body><header><h1><a href="{mount}/">specimux console</a></h1>{who}</header>
 {body}
@@ -449,6 +449,10 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
                 ("Submitted by", esc(run.get("user_id"))),
                 ("Spec", f"<code>{esc(json.dumps(run.get('spec') or {}))}</code>"),
                 ("Versions", esc(json.dumps(run.get("versions") or {})))]
+        if run.get("input_check"):
+            ck = run["input_check"]
+            rows.append(("Files checked", esc(f"{ck.get('specimens')} specimens, {ck.get('primers')} primers in "
+                                              f"{ck.get('pools')} pool(s) (specimux {ck.get('specimux')} --check)")))
         if run.get("upload") and not run.get("manifest"):
             rows.append(("Upload", esc(upload_text(run["upload"]))))
         if run.get("manifest"):

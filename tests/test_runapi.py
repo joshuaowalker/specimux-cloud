@@ -93,8 +93,8 @@ def _create(client, mode="batch", token=None):
             "user_id": "u42"}
     if token:
         data["client_token"] = token
-    files = {"primers": ("primers.fasta", b">ITS1F\nCTTGGTCATTTAGAGGAAGTAA\n"),
-             "specimens": ("Index.txt", b"SampleID\tPrimerPool\nS1\tITS\n")}
+    files = {"primers": ("primers.fasta", b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n"),
+             "specimens": ("Index.txt", b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\n")}
     r = client.post("/v1/runs", data=data, files=files, headers={"X-Service-Key": KEY})
     assert r.status_code == 200, r.text
     return r.json()
@@ -141,7 +141,7 @@ def test_uploads_need_the_job_code_and_signed_urls(api):
     assert key == f"archives/u42/{run['archive_id']}/fastq/a.fastq"
     assert service.storage.head(key).etag == etag
     # tampered signature
-    r = client.put(f"/v1/storage/{key}?exp=9999999999&sig=bad", content=b"x")
+    r = client.put(f"/v1/storage/{key}?exp=9999999999&sig=bad", content=b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\n")
     assert r.status_code == 403
     assert client.get(f"/v1/runs/{run['id']}", headers={"X-Service-Key": KEY}).json()["state"] == "uploading"
 
@@ -499,7 +499,7 @@ def test_hosts_keys_and_scoping(api):
     assert other_key.startswith("fundis.") and other_host["keys"][0]["label"] == "lab-staff"
     mine = _create(client)
     theirs = client.post("/v1/runs", data={"spec": json.dumps({"mode": "batch"}), "user_id": "h"},
-                         files={"primers": ("p", b">a\nA\n"), "specimens": ("s", b"SampleID\tPrimerPool\nS1\tP\n")},
+                         files={"primers": ("p", b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n"), "specimens": ("s", b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\n")},
                          headers={"X-Service-Key": other_key}).json()
     assert theirs["host"] == "fundis"
     them, me = {"X-Service-Key": other_key}, {"X-Service-Key": KEY}
@@ -513,9 +513,9 @@ def test_hosts_keys_and_scoping(api):
     assert client.get(f"/v1/runs/{mine['id']}", headers=me).status_code == 200
     # the client token is per host too
     again = client.post("/v1/runs", data={"spec": "{}", "user_id": "h", "client_token": "ct"},
-                        files={"primers": ("p", b">a\nA\n"), "specimens": ("s", b"x")}, headers=them).json()
+                        files={"primers": ("p", b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n"), "specimens": ("s", b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\n")}, headers=them).json()
     other_again = client.post("/v1/runs", data={"spec": "{}", "user_id": "u", "client_token": "ct"},
-                              files={"primers": ("p", b">a\nA\n"), "specimens": ("s", b"x")}, headers=me).json()
+                              files={"primers": ("p", b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n"), "specimens": ("s", b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\n")}, headers=me).json()
     assert again["id"] != other_again["id"]
     # keys: bad shapes, a second label, rotation with grace, revocation
     for bad in ("", "fundis", "fundis.wrong", "nope.x", KEY + "x"):
@@ -594,8 +594,8 @@ def test_an_abandoned_upload_can_be_deleted(api):
 
 # --- POD5 runs: the dorado stage in front of the engine ---
 
-POD5_FILES = {"primers": ("primers.fasta", b">ITS1F\nCTTGGTCATTTAGAGGAAGTAA\n"),
-              "specimens": ("Index.txt", b"SampleID\tPrimerPool\nS1\tITS\n")}
+POD5_FILES = {"primers": ("primers.fasta", b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n"),
+              "specimens": ("Index.txt", b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\n")}
 
 
 def _create_pod5(client, basecall=None, token=None):
@@ -817,8 +817,8 @@ def test_references_are_kept_once_by_content(api):
     sha = hashlib.sha256(ref).hexdigest()
     svc = {"X-Service-Key": KEY}
     base = {"spec": json.dumps({"mode": "batch", "input": "fastq"}), "user_id": "u42"}
-    inputs = {"primers": ("primers.fasta", b">ITS1F\nCTTGGTCATTTAGAGGAAGTAA\n"),
-              "specimens": ("Index.txt", b"SampleID\tPrimerPool\nS1\tITS\n")}
+    inputs = {"primers": ("primers.fasta", b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n"),
+              "specimens": ("Index.txt", b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\n")}
     assert client.get(f"/v1/references/sha256/{sha}", headers=svc).status_code == 404
     # unknown by hash alone: the host must send the file
     r = client.post("/v1/runs", data={**base, "reference_sha256": sha}, files=inputs, headers=svc)
@@ -964,8 +964,8 @@ def test_each_stage_has_its_own_job_identity(api):
 def _create_live(client, token):
     data = {"spec": json.dumps({"mode": "live", "input": "fastq", "min_reads": 5}), "user_id": "u42",
             "client_token": token}
-    files = {"primers": ("primers.fasta", b">ITS1F\nCTTGGTCATTTAGAGGAAGTAA\n"),
-             "specimens": ("Index.txt", b"SampleID\tPrimerPool\nS1\tITS\n")}
+    files = {"primers": ("primers.fasta", b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n"),
+             "specimens": ("Index.txt", b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\n")}
     r = client.post("/v1/runs", data=data, files=files, headers={"X-Service-Key": KEY})
     assert r.status_code == 200, r.text
     return r.json()
@@ -979,7 +979,7 @@ def test_a_live_run_takes_uploads_while_its_engine_runs(api):
     client, service, launcher = api
     svc = {"X-Service-Key": KEY}
     r = client.post("/v1/runs", data={"spec": json.dumps({"mode": "live", "input": "pod5"}), "user_id": "u"},
-                    files={"primers": ("p", b">p\nA\n"), "specimens": ("s", b"x")}, headers=svc)
+                    files={"primers": ("p", b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n"), "specimens": ("s", b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\n")}, headers=svc)
     assert r.status_code == 400 and "live POD5" in r.text
     run = _create_live(client, "live-1")
     rid, jc = run["id"], {"Authorization": f"JobCode {run['job_code']}"}
@@ -1095,7 +1095,7 @@ def test_a_run_over_an_earlier_archive_is_the_same_host_and_user(api):
     def create(key, user, archive_id, input_="fastq"):
         data = {"spec": json.dumps({"mode": "batch", "input": input_, "archive_id": archive_id}),
                 "user_id": user}
-        files = {"primers": ("primers.fasta", b">p\nACGT\n"), "specimens": ("Index.txt", b"SampleID\n")}
+        files = {"primers": ("primers.fasta", b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n"), "specimens": ("Index.txt", b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\n")}
         return client.post("/v1/runs", data=data, files=files, headers={"X-Service-Key": key})
 
     # only once the run that uploaded it finished (and wasn't cancelled)
@@ -1113,7 +1113,7 @@ def test_a_run_over_an_earlier_archive_is_the_same_host_and_user(api):
     assert create(KEY, "u42", first["archive_id"], "pod5").status_code == 400   # holds FASTQ
     for bad in ("../u42", "u42/x", ".hidden", "a" * 129):
         r = client.post("/v1/runs", data={"spec": "{}", "user_id": bad},
-                        files={"primers": ("p", b">p\nA\n"), "specimens": ("i", b"x\n")},
+                        files={"primers": ("p", b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n"), "specimens": ("i", b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\n")},
                         headers={"X-Service-Key": KEY})
         assert r.status_code == 400, bad
 
@@ -1256,7 +1256,7 @@ def test_a_reference_is_usable_by_hash_only_by_hosts_that_sent_it(api):
     _, other_key = service.add_host("elsewhere", name="Elsewhere", label="server")
     mine, theirs = {"X-Service-Key": KEY}, {"X-Service-Key": other_key}
     base = {"spec": json.dumps({"mode": "batch", "input": "fastq"}), "user_id": "u1"}
-    inputs = {"primers": ("primers.fasta", b">p\nACGT\n"), "specimens": ("Index.txt", b"SampleID\n")}
+    inputs = {"primers": ("primers.fasta", b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n"), "specimens": ("Index.txt", b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\n")}
     assert client.post("/v1/runs", data=base, files={**inputs, "reference": ("r.fasta", ref)},
                        headers=mine).status_code == 200
     assert client.get(f"/v1/references/sha256/{sha}", headers=mine).status_code == 200
@@ -1299,8 +1299,8 @@ def test_a_run_name_names_the_downloads(api):
     downloads: Run150_Summary.zip, reduced to filename-safe characters."""
     from specimux_cloud.packages import download_name
     client, service, _ = api
-    files = {"primers": ("primers.fasta", b">ITS1F\nCTTGGTCATTTAGAGGAAGTAA\n"),
-             "specimens": ("Index.txt", b"SampleID\tPrimerPool\nS1\tITS\n")}
+    files = {"primers": ("primers.fasta", b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n"),
+             "specimens": ("Index.txt", b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\nS1\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCCTAG\tITS4\n")}
 
     def create(name):
         spec = {"mode": "batch", "input": "fastq", "profile": "default", "name": name}
@@ -1361,7 +1361,7 @@ def test_a_rerun_from_the_basecalled_reads(api):
     client, service, launcher = api
     source = _sealed_pod5(client, service, launcher, ref=b'>R name="Amanita"\nACGT\n')
     sid = source["id"]
-    fixed = b">ITS1F\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4\nTCCTCCGCTTATTGATATGC\n"
+    fixed = b">ITS1F pool=ITS position=forward\nCTTGGTCATTTAGAGGAAGTAA\n>ITS4 pool=ITS position=reverse\nTCCTCCGCTTATTGATATGC\n>gITS7 pool=ITS position=forward\nGTGARTCATCGARTCTTTG\n"
     r = _rerun(client, sid, {"name": "Run155 rerun"}, files={"primers": ("primers.fasta", fixed)})
     assert r.status_code == 200, r.text
     run = r.json()
@@ -1491,3 +1491,50 @@ def test_a_rerun_interrupted_while_copying_is_finished_later(api):
     service.storage.copy = real_copy
     service.reconcile(intent_grace_s=0)
     assert service.get_run(stuck[0]["id"])["state"] == "input_complete"   # the engine slot is busy: queued
+
+
+# Run155's files: the forward primer is in another pool, and the specimens
+# name one the primers file doesn't have
+RUN155_PRIMERS = (b">ITS1Fngs pool=ITSnew position=forward\nGGTCATTTAGAGGAAGTAA\n"
+                  b">ITS4ngsUni pool=ITS,ITSnew position=reverse\nCCTSCSCTTANTDATATGC\n")
+RUN155_SPECIMENS = b"SampleID\tPrimerPool\tFwIndex\tFwPrimer\tRvIndex\tRvPrimer\n" + b"".join(
+    f"S{i}\tITS\tAGCAATCGCGCAC\tITS1F\tAACCAGCGCC{i:03d}\tITS4ngsUni\n".encode() for i in range(40))
+
+
+def test_bad_primers_and_specimens_are_refused_at_creation(api):
+    """specimux --check at POST /v1/runs: a pair a run would refuse is
+    refused before any upload, with every problem."""
+    client, service, _ = api
+    files = {"primers": ("primers.fasta", RUN155_PRIMERS), "specimens": ("Index.txt", RUN155_SPECIMENS)}
+    r = client.post("/v1/runs", data={"spec": json.dumps({"input": "pod5"}), "user_id": "u42"}, files=files,
+                    headers={"X-Service-Key": KEY})
+    assert r.status_code == 400
+    body = r.json()
+    assert body["error"].startswith("The primers and specimens files have problems")
+    assert "primers file" in body["error"] and "Pool ITS has no forward primers" in body["error"]
+    assert "specimens file, line 2: FwPrimer 'ITS1F' is not in the primers file" in body["error"]
+    assert "(and 39 more rows)" in body["error"]
+    assert {p["file"] for p in body["problems"]} == {"primers", "specimens"}
+    assert service.store.list_runs() == []
+    # a good pair is recorded with what the check counted
+    run = _create(client)
+    assert run["input_check"]["specimens"] == 1 and run["input_check"]["pools"] == 1
+    assert run["input_check"]["specimux"]
+
+
+def test_a_rerun_is_checked_too(api):
+    """A rerun with the source's bad files is refused; with the fixed files
+    it runs."""
+    client, service, launcher = api
+    source = _sealed_pod5(client, service, launcher)
+    sid = source["id"]
+    service.storage.put(f"runs/u42/{sid}/input/primers", RUN155_PRIMERS)
+    service.storage.put(f"runs/u42/{sid}/input/specimens", RUN155_SPECIMENS)
+    r = _rerun(client, sid)
+    assert r.status_code == 400 and "Pool ITS has no forward primers" in r.json()["error"]
+    fixed = RUN155_PRIMERS.replace(b"pool=ITSnew position=forward", b"pool=ITS,ITSnew position=forward")
+    r = _rerun(client, sid, files={"primers": ("primers.fasta", fixed)})
+    assert r.status_code == 400 and "FwPrimer 'ITS1F'" in r.json()["error"]       # still the specimens
+    r = _rerun(client, sid, files={"primers": ("primers.fasta", fixed),
+                                   "specimens": ("Index.txt", RUN155_SPECIMENS.replace(b"\tITS1F\t", b"\tITS1Fngs\t"))})
+    assert r.status_code == 200, r.text

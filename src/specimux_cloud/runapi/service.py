@@ -163,10 +163,11 @@ COMMANDS = ("watch", "unwatch", "correct", "dismiss", "rescan", "finalize", "abo
 
 
 class ServiceError(Exception):
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str, extra: Optional[dict] = None):
         super().__init__(message)
         self.status = status
         self.message = message
+        self.extra = extra or {}     # more fields for the error body (e.g. problems)
 
 
 @dataclass
@@ -217,6 +218,13 @@ class ServiceConfig:
     @property
     def secure_cookies(self) -> bool:
         return self.base_url.lower().startswith("https://")
+
+
+def problem_text(problem: dict) -> str:
+    """One problem from the input check, as a line for a person."""
+    where = f"{problem['file']} file" + (f", line {problem['line']}" if problem.get("line") else "")
+    more = f" (and {problem['count'] - 1} more rows)" if (problem.get("count") or 1) > 1 else ""
+    return f"{where}: {problem['message']}{more}"
 
 
 def _hash_secret(secret: str) -> str:
@@ -401,6 +409,11 @@ class RunService:
         for role in ("primers", "specimens"):
             if role not in files:
                 raise ServiceError(400, f"missing input file: {role}")
+        checked = self.check_inputs(files["primers"], files["specimens"])
+        if not checked["valid"]:
+            lines = [problem_text(p) for p in checked["problems"]]
+            raise ServiceError(400, "The primers and specimens files have problems (specimux --check):\n"
+                                    + "\n".join(lines), extra={"problems": checked["problems"]})
         run_id = _new_run_id()
         secret = secrets.token_urlsafe(24)
         run = {
@@ -416,6 +429,7 @@ class RunService:
             "jobs": {},
             "versions": {"suite": suite_version, "cloud": cloud_version},
             "effective_config": None,
+            "input_check": {k: checked[k] for k in ("primers", "pools", "specimens", "specimux")},
             "ingested_files": [],
             "exit": None,
         }
@@ -463,6 +477,26 @@ class RunService:
             raise ServiceError(409, f"That upload is {int(age // 86400)} days old: uploads move to cold storage "
                                     f"30 days after upload, and running over them again is not supported yet")
         return archive
+
+    @staticmethod
+    def check_inputs(primers: bytes, specimens: bytes) -> dict:
+        """specimux's own check of a primers and a specimens file (what a
+        run would refuse before reading any reads: pools, primer names,
+        columns, duplicate ids), so a bad pair is refused before an upload
+        and hours of basecalling. Every problem at once, each naming its
+        file by role."""
+        import specimux
+        from specimux.check import check_inputs
+        with tempfile.TemporaryDirectory() as d:
+            paths = {"primers": Path(d) / "primers", "specimens": Path(d) / "specimens"}
+            paths["primers"].write_bytes(primers)
+            paths["specimens"].write_bytes(specimens)
+            result = check_inputs(str(paths["primers"]), str(paths["specimens"]))
+        roles = {str(p): role for role, p in paths.items()}
+        return {"valid": result.valid, "primers": result.primers, "pools": result.pools,
+                "specimens": result.specimens, "specimux": specimux.__version__,
+                "problems": [{"file": roles.get(p.file, p.file), "line": p.line, "message": p.message,
+                              "count": p.count} for p in result.problems]}
 
     @staticmethod
     def _rerun_reads_archive(spec: dict) -> bool:
