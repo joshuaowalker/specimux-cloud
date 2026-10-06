@@ -285,7 +285,8 @@ pre {{ background: rgba(127,127,127,.12); padding: 12px; border-radius: 6px; ove
 <span class="muted">The default keeps every plausible amplicon; the published protocol narrows it to 400 to 2000 for the full ITS, 100 to 700 for ITS2 alone.</span>
 <label for="min_qscore">Minimum read qscore (optional)</label><input type="number" id="min_qscore" name="min_qscore" step="0.1" min="0" style="width:7em" value="{esc(bc.get("min_qscore") if bc.get("min_qscore") is not None else "")}">
 </fieldset>"""
-        token = f'<input type="hidden" name="client_token" value="{esc(hashlib.sha1(f"{time.time()}{user["label"]}".encode()).hexdigest())}">'
+        client_token = hashlib.sha1(f"{time.time()}{user['label']}".encode()).hexdigest()
+        token = f'<input type="hidden" name="client_token" value="{esc(client_token)}">'
         drive = ""
         if "google_drive" in (opts.get("sources") or []):
             drive = """<label for="drive_folder">…from a Google Drive folder instead of an upload (optional; batch only)</label>
