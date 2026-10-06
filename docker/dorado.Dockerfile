@@ -10,7 +10,9 @@
 # ones in dorado's models list, e.g. there is no sup@v6.0.0); the run API
 # offers the matching model complexes (SPECIMUX_DORADO_MODELS in
 # infra/stack.py), so the two lists change together.
-FROM ubuntu:24.04
+# Pinned: a moved tag invalidates every layer below, and the dorado and
+# model layers (~6 GB) then go up again from a slow uplink (Oct 6 2026)
+FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
 ARG DORADO_VERSION=2.1.2
 ARG DORADO_MODELS="dna_r10.4.1_e8.2_400bps_sup@v5.0.0 dna_r10.4.1_e8.2_400bps_sup@v5.2.0 dna_r10.4.1_e8.2_400bps_hac@v6.0.0"
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates python3 python3-venv \

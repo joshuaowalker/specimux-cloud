@@ -21,7 +21,9 @@ ENV PATH=/opt/conda/bin:$PATH
 RUN pip install --no-cache-dir "${SUITE_SPEC}"
 COPY pyproject.toml README.md /src/
 COPY src /src/src
-RUN pip install --no-cache-dir --no-deps /src && pip install --no-cache-dir httpx cryptography python-multipart
+# with its dependencies (only what the suite's layer lacks or has too old,
+# e.g. a newer specimux), and a build that leaves a conflict fails
+RUN pip install --no-cache-dir /src && pip check
 # EFS is mounted here by the job definition; the run API passes
 # SPECIMUX_WORK_DIR=/mnt/runs/<run id>
 RUN mkdir -p /mnt/runs
