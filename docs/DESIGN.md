@@ -192,7 +192,8 @@ All under `/v1`. "Service key" routes see only the calling host's runs.
 | `POST /runs/{id}/tokens` (mint a run token) | host's authorize route | service key |
 | `GET /hosts/me`, `GET /options`, `GET /load`, `GET /references/sha256/{hex}` | host | service key |
 | `GET /version` | anyone | none |
-| `POST /runs/{id}/uploads` (presigned PUTs) | uploader | job code |
+| `POST /runs/{id}/uploads` (presigned PUTs; with `sizes`, a file over 5 GB gets an upload in parts) | uploader | job code |
+| `POST /runs/{id}/uploads/parts` (presigned PUTs for parts), `POST /runs/{id}/uploads/assemble` (the parts become the file) | uploader | job code |
 | `GET /runs/{id}/upload` (does the run still take uploads) | uploader | job code, also after the run closes |
 | `POST /runs/{id}/complete` (manifest, or none: built from the listing) | uploader, host | job code or service key |
 | `GET /runs/{id}/job` (bundle) | any job | job secret, active job |
@@ -312,6 +313,41 @@ waiting for a fetch slot stays `created`; the dashboard banner says
 header, never in a URL (request logs and errors can't carry it), and
 reaches the job only in its bundle.
 
+**Files over 5 GB.** A presigned PUT is one request, and S3 takes at
+most 5 GB in one. MinKNOW writes POD5 files larger than that: a run of
+five files had three of 6 GB, and nothing short of splitting them with
+the pod5 tools would get them in. So a file can go up in parts. The
+uploader names each file's size with its request (`sizes`, bytes by
+name); for one over 5 GB (`single_put_max`) the answer has no `url` but
+`multipart: {upload_id, part_size, parts}`: S3's multipart upload,
+started by the service. The uploader asks for each part's address just
+before sending it (`POST /runs/{id}/uploads/parts` with `file`,
+`upload_id` and up to 100 part numbers; an address is good for an hour
+at most, and less when the run API's credentials that signed it are near
+their end), PUTs each part of `part_size` bytes (128 MB;
+the last is the remainder) and keeps the ETag each PUT answers with, then
+`POST /runs/{id}/uploads/assemble` with `file`, `upload_id`, `size` and
+`parts: [{number, etag}]`. The service has storage put the parts
+together and answers `{key, size, etag}`: the file's entry for the
+manifest. An object that does not come out the announced size (a part
+left off the list) is deleted and the request refused. The same request
+again, its answer lost on the way, gets the same answer.
+
+Nothing changes for a file up to 5 GB or an uploader that sends no
+sizes: one PUT, as before. A part sent twice is the last one sent, so
+the uploader keeps the parts it has sent in its state file and a restart
+sends only the rest; if the file changed meanwhile it starts over. A
+part storage refuses (an address that expired, a slow connection S3 gave
+up on) is sent again with a fresh address, three tries in all, rather
+than stopping an uploader that may be running unattended through a
+night of sequencing. The bucket already drops an unfinished multipart upload after a week
+(`infra/stack.py`), which is the cleanup for an upload that is never
+finished, and the bucket's CORS rule already lets a browser PUT a part
+and read its ETag. `GET /options` lists `uploads: {single_put_max,
+part_size}`, so a host that uploads from its own page knows it may send
+a file of any size. A run from a Google Drive folder still stops at 5 GB
+a file: that copy is one PUT of the service's own.
+
 **Abandoned uploads.** The two-minute reconcile ends a run with no upload
 request for 24 hours, or created and never uploaded to within 7 days (a
 lab may create a run days before sequencing ends), as `incomplete` with
@@ -393,8 +429,9 @@ its file back), with fresh presigned URLs. It writes each FASTQ to
 and claims again until nothing is left, then exits and frees its GPU at
 once. Claiming instead of a split fixed in advance means a GPU that never
 arrives (G capacity is often exhausted) or runs slower only takes fewer
-files. MinKNOW writes POD5 in files of 2-3 GB, so files are the unit; a
-file is never split between GPUs.
+files. MinKNOW writes POD5 in files of a few GB (2-3 GB in ont98 and
+Run155, three of 6 GB in Run163), so files are the unit; a file is never
+split between GPUs ("Open questions").
 
 A run gets a second worker when a GPU is free, no run is queued for one
 (a queued run always takes a freed GPU first), and the work no worker
@@ -845,6 +882,16 @@ spend to two runs per stage.
 
 - **Live POD5** (dorado bursts beside a live engine), and Spot GPUs with
   per-file fan-out once the Spot G quota allows.
+- **Splitting a large POD5 between GPUs.** A basecall worker claims whole
+  files, so one large file is one GPU's work (about 40 minutes for 6 GB
+  at Run155's rate) while another GPU may finish early and sit idle. The
+  pod5 tools can rewrite a file as several smaller ones by reads
+  (`pod5 subset`, `pod5 filter`), with no overlap needed since reads are
+  independent. Done in the service, by a CPU job before basecalling or by
+  workers claiming a range of a file's reads, it would spread a run's
+  work evenly across GPUs while the archive keeps the files MinKNOW
+  wrote. The uploader stays out of it: it would need the pod5 library,
+  and the disk and time to rewrite files on the sequencing computer.
 - **Reprocessing from Deep Archive**: the restore step before a run over an
   archived input.
 - **A single run API task.** A second task needs shared fan-out for SSE.

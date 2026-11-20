@@ -27,6 +27,9 @@ from .base import (ConflictError, JobHandle, JobSpec, JobStatus, Message,
                    ObjectInfo)
 
 
+MULTIPART_DIR = ".multipart"   # parts of objects still being uploaded; never listed
+
+
 def _etag(path: Path) -> str:
     """What S3 reports for a single-part object: the hex MD5."""
     h = hashlib.md5()
@@ -100,7 +103,8 @@ class DirectoryStorage:
             return []
         out = []
         for p in sorted(base.rglob("*")):
-            if p.is_file() and not p.name.endswith(".tmp") and not p.name.endswith(".part"):
+            if p.is_file() and not p.name.endswith(".tmp") and not p.name.endswith(".part") \
+                    and MULTIPART_DIR not in p.relative_to(self.root).parts:
                 key = str(p.relative_to(self.root))
                 out.append(ObjectInfo(key, p.stat().st_size, _etag(p)))
         return out
@@ -135,6 +139,84 @@ class DirectoryStorage:
         url = self._presign("GET", key, expires_s)
         # the name is not signed: it only names the saved file
         return url + (f"&{urlencode({'filename': filename})}" if filename else "")
+
+    # an object in parts: the parts wait under .multipart/<upload id>/ and
+    # become the object when assembled, as on S3
+    def _parts_dir(self, key: str, upload_id: str) -> Path:
+        if not isinstance(upload_id, str) or len(upload_id) != 32 or any(c not in "0123456789abcdef" for c in upload_id):
+            raise ValueError("Unknown upload")
+        d = self.root / MULTIPART_DIR / upload_id
+        try:
+            owner = (d / "key").read_text()
+        except OSError:
+            raise ValueError("Unknown upload") from None
+        if owner != _safe_key(key):
+            raise ValueError("Unknown upload")
+        return d
+
+    def multipart_start(self, key: str) -> str:
+        upload_id = uuid.uuid4().hex
+        d = self.root / MULTIPART_DIR / upload_id
+        d.mkdir(parents=True)
+        (d / "key").write_text(_safe_key(key))
+        return upload_id
+
+    @staticmethod
+    def _part_method(upload_id: str, number: int) -> str:
+        # what a part's URL is signed for: this part of this upload only
+        return f"PUT part {int(number)} of {upload_id}"
+
+    def presign_part(self, key: str, upload_id: str, number: int, expires_s: int = 3600) -> str:
+        key = _safe_key(key)
+        exp = int(time.time()) + expires_s
+        q = urlencode({"exp": exp, "sig": self._sign(self._part_method(upload_id, number), key, exp),
+                       "upload_id": upload_id, "part": int(number)})
+        return f"{self.base_url}/v1/storage/{quote(key)}?{q}"
+
+    def verify_part(self, key: str, upload_id: str, number: str, exp: str, sig: str) -> bool:
+        try:
+            method = self._part_method(upload_id, int(number))
+        except (TypeError, ValueError):
+            return False
+        return self.verify(method, key, exp, sig)
+
+    def put_part(self, key: str, upload_id: str, number: int, data: bytes) -> str:
+        """Store one part; returns its ETag (the hex MD5, as S3 answers)."""
+        d = self._parts_dir(key, upload_id)
+        p = d / f"{int(number):05d}"
+        tmp = p.with_name(p.name + f".{uuid.uuid4().hex[:8]}.tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, p)
+        return hashlib.md5(data).hexdigest()
+
+    def multipart_complete(self, key: str, upload_id: str, parts: Iterable[dict]) -> ObjectInfo:
+        d = self._parts_dir(key, upload_id)
+        parts = [dict(p) for p in parts]
+        numbers = [int(p["number"]) for p in parts]
+        if not numbers or numbers != sorted(set(numbers)):
+            raise ValueError("Parts must be listed once each, in order")
+        files = []
+        for p in parts:
+            f = d / f"{int(p['number']):05d}"
+            if not f.is_file() or _etag(f) != str(p.get("etag") or "").strip('"'):
+                raise ValueError(f"Part {int(p['number'])} is missing or is not the one uploaded")
+            files.append(f)
+        target = self._path(key)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(target.name + f".{uuid.uuid4().hex[:8]}.tmp")
+        with open(tmp, "wb") as out:
+            for f in files:
+                with open(f, "rb") as src:
+                    shutil.copyfileobj(src, out)
+        os.replace(tmp, target)
+        shutil.rmtree(d, ignore_errors=True)
+        return ObjectInfo(_safe_key(key), target.stat().st_size, _etag(target))
+
+    def multipart_abort(self, key: str, upload_id: str) -> None:
+        try:
+            shutil.rmtree(self._parts_dir(key, upload_id), ignore_errors=True)
+        except ValueError:
+            pass
 
     def verify(self, method: str, key: str, exp: str, sig: str) -> bool:
         try:

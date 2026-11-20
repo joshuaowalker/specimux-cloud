@@ -56,6 +56,29 @@ class Storage(Protocol):
         """A GET URL; with ``filename``, the download is saved under that name."""
         ...
 
+    # An object in parts, for a file over what one presigned PUT carries
+    # (5 GB on S3). The client PUTs each part to its own presigned URL and
+    # keeps the ETag each PUT answers with; the parts become the object
+    # when they are assembled. These raise ValueError for an upload id the
+    # storage does not know for the key, or parts it cannot assemble.
+
+    def multipart_start(self, key: str) -> str:
+        """Begin an upload of ``key`` in parts; returns its upload id."""
+        ...
+
+    def presign_part(self, key: str, upload_id: str, number: int, expires_s: int = 3600) -> str:
+        """A PUT URL for part ``number`` (from 1) of the upload."""
+        ...
+
+    def multipart_complete(self, key: str, upload_id: str, parts: Iterable[dict]) -> ObjectInfo:
+        """Assemble the object from its parts: ``{"number", "etag"}`` for
+        every part, in order. The parts are gone afterwards."""
+        ...
+
+    def multipart_abort(self, key: str, upload_id: str) -> None:
+        """Drop an unfinished upload and its parts. Unknown is fine."""
+        ...
+
 
 # --- Command queue ---
 

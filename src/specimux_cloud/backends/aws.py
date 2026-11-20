@@ -120,6 +120,41 @@ class S3Storage:
             params["ResponseContentDisposition"] = f'attachment; filename="{filename}"'
         return self.client.generate_presigned_url("get_object", Params=params, ExpiresIn=expires_s)
 
+    # an object in parts (a multipart upload): a presigned PUT carries 5 GB
+    # at most, a part of one as much again, and an object 10,000 parts
+
+    # the answers that mean "not this upload, or not these parts"
+    _MULTIPART_REFUSALS = ("NoSuchUpload", "InvalidPart", "InvalidPartOrder", "EntityTooSmall", "MalformedXML")
+
+    def multipart_start(self, key: str) -> str:
+        return self.client.create_multipart_upload(Bucket=self.bucket, Key=key)["UploadId"]
+
+    def presign_part(self, key: str, upload_id: str, number: int, expires_s: int = 3600) -> str:
+        return self.client.generate_presigned_url(
+            "upload_part", Params={"Bucket": self.bucket, "Key": key, "UploadId": upload_id,
+                                   "PartNumber": int(number)},
+            ExpiresIn=expires_s, HttpMethod="PUT")
+
+    def multipart_complete(self, key: str, upload_id: str, parts: Iterable[dict]) -> ObjectInfo:
+        listed = [{"PartNumber": int(p["number"]), "ETag": '"%s"' % str(p.get("etag") or "").strip('"')}
+                  for p in parts]
+        try:
+            self.client.complete_multipart_upload(Bucket=self.bucket, Key=key, UploadId=upload_id,
+                                                  MultipartUpload={"Parts": listed})
+        except self.client.exceptions.ClientError as e:
+            error = e.response.get("Error", {})
+            if error.get("Code") in self._MULTIPART_REFUSALS:
+                raise ValueError(f"{error.get('Code')}: {error.get('Message', '')}".strip(": ")) from None
+            raise
+        return self.head(key)
+
+    def multipart_abort(self, key: str, upload_id: str) -> None:
+        try:
+            self.client.abort_multipart_upload(Bucket=self.bucket, Key=key, UploadId=upload_id)
+        except self.client.exceptions.ClientError as e:
+            if e.response.get("Error", {}).get("Code") != "NoSuchUpload":
+                raise
+
 
 # --- Command queue ---
 

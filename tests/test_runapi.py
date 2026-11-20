@@ -131,6 +131,97 @@ def _upload(client, run, name, data):
     return r.json()["uploads"][name]["key"], put.headers["etag"].strip('"')
 
 
+def test_a_file_over_what_one_put_carries_goes_up_in_parts(api):
+    client, service, launcher = api
+    # one PUT carries 5 GB on S3; small numbers here
+    service.config.single_put_max, service.config.upload_part_size = 10, 4
+    opts = client.get("/v1/options", headers={"X-Service-Key": KEY}).json()
+    assert opts["uploads"] == {"single_put_max": 10, "part_size": 4}
+    run = _create(client)
+    hdr = {"Authorization": f"JobCode {run['job_code']}"}
+    base = f"/v1/runs/{run['id']}/uploads"
+    data = b"@r1\nACGT\n+\nIIII\n"                                      # 16 bytes: 4 parts of 4
+
+    r = client.post(base, json={"files": ["small.fastq", "big.fastq"],
+                                "sizes": {"small.fastq": 10, "big.fastq": len(data)}}, headers=hdr)
+    assert r.status_code == 200, r.text
+    ups = r.json()["uploads"]
+    assert "url" in ups["small.fastq"] and "multipart" not in ups["small.fastq"]   # up to the limit: one PUT, as ever
+    big = ups["big.fastq"]
+    assert "url" not in big and big["key"].endswith("/fastq/big.fastq")
+    mp = big["multipart"]
+    assert (mp["part_size"], mp["parts"]) == (4, 4) and mp["upload_id"]
+    # a file given no size gets one PUT, whatever its size: an uploader from before this
+    assert "url" in client.post(base, json={"files": ["big.fastq"]}, headers=hdr).json()["uploads"]["big.fastq"]
+
+    # part addresses need the job code and are asked for by number
+    ask = {"file": "big.fastq", "upload_id": mp["upload_id"], "parts": [1, 2]}
+    assert client.post(f"{base}/parts", json=ask, headers={"Authorization": f"JobCode {run['id']}.wrong"}).status_code == 403
+    for bad in ({**ask, "parts": []}, {**ask, "parts": [0]}, {**ask, "parts": [10001]}, {**ask, "parts": ["1"]},
+                {**ask, "parts": list(range(1, 102))}, {**ask, "upload_id": ""}, {**ask, "file": "../x"}):
+        assert client.post(f"{base}/parts", json=bad, headers=hdr).status_code == 400, bad
+    etags = {}
+    for batch in ([1, 2], [3, 4]):
+        urls = client.post(f"{base}/parts", json={**ask, "parts": batch}, headers=hdr).json()["parts"]
+        for n in batch:
+            put = client.put(urls[str(n)], content=data[(n - 1) * 4:n * 4])
+            assert put.status_code == 200, put.text
+            etags[n] = put.headers["etag"].strip('"')
+    # a part's address takes that part only
+    url = client.post(f"{base}/parts", json={**ask, "parts": [1]}, headers=hdr).json()["parts"]["1"]
+    assert client.put(url.replace("part=1", "part=2"), content=b"XXXX").status_code == 403
+    # the service sees no file until it is assembled
+    assert service.storage.head(big["key"]) is None
+    listed = [{"number": n, "etag": etags[n]} for n in (1, 2, 3, 4)]
+    done = {"file": "big.fastq", "upload_id": mp["upload_id"], "size": len(data), "parts": listed}
+    assert client.post(f"{base}/assemble", json=done, headers={"Authorization": f"JobCode {run['id']}.wrong"}).status_code == 403
+    for bad in ({**done, "parts": []}, {**done, "parts": [{"number": 1}]}, {**done, "parts": listed + listed[:1]},
+                {**done, "parts": [{"number": 1, "etag": "not hex!"}]}, {**done, "size": "16"}, {**done, "upload_id": None}):
+        assert client.post(f"{base}/assemble", json=bad, headers=hdr).status_code == 400, bad
+    # a part that is not the one uploaded: refused, and nothing is made
+    wrong = {**done, "parts": [{"number": 1, "etag": "0" * 32}] + listed[1:]}
+    assert client.post(f"{base}/assemble", json=wrong, headers=hdr).status_code == 409
+    assert service.storage.head(big["key"]) is None
+
+    r = client.post(f"{base}/assemble", json={**done, "parts": list(reversed(listed))}, headers=hdr)   # any order
+    assert r.status_code == 200, r.text
+    made = r.json()
+    assert (made["key"], made["size"]) == (big["key"], len(data)) and service.storage.get(big["key"]) == data
+    assert made["etag"] == service.storage.head(big["key"]).etag
+    # the same request again, its answer lost on the way: the same answer
+    again = client.post(f"{base}/assemble", json=done, headers=hdr)
+    assert again.status_code == 200 and again.json() == made
+    # the run takes the file like any other
+    r = client.post(f"/v1/runs/{run['id']}/complete",
+                    json={"manifest": [{"key": made["key"], "size": made["size"], "etag": made["etag"]}]}, headers=hdr)
+    assert r.status_code == 200, r.text
+    assert [m["key"] for m in r.json()["manifest"]] == [big["key"]]
+    # once the upload is complete nothing more is taken
+    assert client.post(base, json={"files": ["late.fastq"], "sizes": {"late.fastq": 99}}, headers=hdr).status_code == 409
+    assert client.post(f"{base}/parts", json=ask, headers=hdr).status_code == 409
+    assert client.post(f"{base}/assemble", json=done, headers=hdr).status_code == 409
+
+
+def test_a_file_assembled_short_of_its_announced_size_is_not_kept(api):
+    client, service, _ = api
+    service.config.single_put_max, service.config.upload_part_size = 10, 4
+    run = _create(client)
+    hdr = {"Authorization": f"JobCode {run['job_code']}"}
+    base = f"/v1/runs/{run['id']}/uploads"
+    for bad in ({"big.fastq": -1}, {"big.fastq": "12"}, {"big.fastq": True}, {"big.fastq": 4 * 10_000 + 1}):
+        assert client.post(base, json={"files": ["big.fastq"], "sizes": bad}, headers=hdr).status_code == 400, bad
+    assert client.post(base, json={"files": ["big.fastq"], "sizes": [12]}, headers=hdr).status_code == 400
+    big = client.post(base, json={"files": ["big.fastq"], "sizes": {"big.fastq": 12}}, headers=hdr).json()["uploads"]["big.fastq"]
+    ask = {"file": "big.fastq", "upload_id": big["multipart"]["upload_id"]}
+    urls = client.post(f"{base}/parts", json={**ask, "parts": [1, 2, 3]}, headers=hdr).json()["parts"]
+    etags = {n: client.put(urls[str(n)], content=b"ACGT").headers["etag"].strip('"') for n in (1, 2, 3)}
+    # the last part left off the list: 8 bytes are not the 12-byte file
+    r = client.post(f"{base}/assemble", json={**ask, "size": 12, "parts": [{"number": n, "etag": etags[n]} for n in (1, 2)]},
+                    headers=hdr)
+    assert r.status_code == 409 and "8 bytes" in r.json()["error"] and "12" in r.json()["error"]
+    assert service.storage.head(big["key"]) is None
+
+
 def test_uploads_need_the_job_code_and_signed_urls(api):
     client, service, _ = api
     run = _create(client)

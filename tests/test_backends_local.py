@@ -47,6 +47,52 @@ def test_directory_storage_presigning(tmp_path):
     assert not s.verify("GET", "a", q["exp"][0], q["sig"][0])
 
 
+def test_directory_storage_takes_an_object_in_parts(tmp_path):
+    """What S3's multipart upload does, for a file over what one PUT carries."""
+    import pytest
+    from urllib.parse import parse_qs, urlsplit
+    s = DirectoryStorage(tmp_path, base_url="http://api.local", secret="k")
+    key = "archives/u/a1/pod5/big.pod5"
+    upload = s.multipart_start(key)
+    # a part's URL is good for that part of that upload only
+    q = parse_qs(urlsplit(s.presign_part(key, upload, 2, expires_s=60)).query)
+    assert (q["upload_id"], q["part"]) == ([upload], ["2"])
+    assert s.verify_part(key, upload, "2", q["exp"][0], q["sig"][0])
+    assert not s.verify_part(key, upload, "3", q["exp"][0], q["sig"][0])
+    assert not s.verify_part(key, s.multipart_start(key), "2", q["exp"][0], q["sig"][0])
+    assert not s.verify_part("archives/u/a1/pod5/other.pod5", upload, "2", q["exp"][0], q["sig"][0])
+    assert not s.verify("PUT", key, q["exp"][0], q["sig"][0])            # not a whole-object PUT
+    assert not s.verify_part(key, upload, "x", q["exp"][0], q["sig"][0])
+
+    etags = {n: s.put_part(key, upload, n, data) for n, data in ((1, b"AAAA"), (2, b"BBBB"), (3, b"CC"))}
+    assert s.put_part(key, upload, 2, b"bbbb") != etags[2]              # sent again: the last one counts
+    etags[2] = s.put_part(key, upload, 2, b"BBBB")
+    assert s.head(key) is None and s.list("archives/") == []            # no object until assembled, parts never listed
+    with pytest.raises(ValueError):
+        s.put_part(key, "0" * 32, 1, b"x")                              # an upload nobody started
+    with pytest.raises(ValueError):
+        s.put_part("archives/u/a1/pod5/other.pod5", upload, 1, b"x")     # another object's upload
+    with pytest.raises(ValueError):
+        s.multipart_complete(key, upload, [{"number": 1, "etag": etags[1]}, {"number": 2, "etag": "0" * 32}])
+    with pytest.raises(ValueError):
+        s.multipart_complete(key, upload, [{"number": 2, "etag": etags[2]}, {"number": 1, "etag": etags[1]}])
+    with pytest.raises(ValueError):
+        s.multipart_complete(key, upload, [{"number": 4, "etag": etags[1]}])   # a part never sent
+
+    info = s.multipart_complete(key, upload, [{"number": n, "etag": f'"{etags[n]}"'} for n in (1, 2, 3)])
+    assert (info.key, info.size) == (key, 10) and s.get(key) == b"AAAABBBBCC"
+    assert s.head(key) == info and [o.key for o in s.list("archives/")] == [key]
+    with pytest.raises(ValueError):
+        s.multipart_complete(key, upload, [{"number": 1, "etag": etags[1]}])   # the parts are gone
+    # dropping an unfinished upload, and one already gone
+    other = s.multipart_start(key)
+    s.put_part(key, other, 1, b"x")
+    s.multipart_abort(key, other)
+    s.multipart_abort(key, other)
+    with pytest.raises(ValueError):
+        s.put_part(key, other, 2, b"y")
+
+
 def test_memory_queue_redelivers_until_acked():
     q = MemoryQueue(visibility_s=0.2)
     q.send("r1", {"command": "watch"})

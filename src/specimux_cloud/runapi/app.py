@@ -332,7 +332,28 @@ def create_app(service: RunService, console: bool = True) -> FastAPI:
         names = body.get("files") or []
         if not isinstance(names, list) or not names:
             raise ServiceError(400, "files: a list of file names")
-        return await run_in_threadpool(service.presign_uploads, run_id, [str(n) for n in names])
+        # sizes (bytes by name) lets a file over what one PUT carries be
+        # sent in parts; without it every file gets one PUT, as before
+        return await run_in_threadpool(service.presign_uploads, run_id, [str(n) for n in names],
+                                       body.get("sizes"))
+
+    @app.post("/v1/runs/{run_id}/uploads/parts")
+    async def presign_parts(run_id: str, request: Request, run: dict = Depends(job_code)):
+        """PUT addresses for parts of a file being uploaded in parts."""
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ServiceError(400, "file, upload_id and parts")
+        return await run_in_threadpool(service.presign_upload_parts, run_id, body.get("file"),
+                                       body.get("upload_id"), body.get("parts"))
+
+    @app.post("/v1/runs/{run_id}/uploads/assemble")
+    async def assemble(run_id: str, request: Request, run: dict = Depends(job_code)):
+        """Make the object from a file's uploaded parts."""
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ServiceError(400, "file, upload_id, parts and size")
+        return await run_in_threadpool(service.assemble_upload, run_id, body.get("file"), body.get("upload_id"),
+                                       body.get("parts"), body.get("size"))
 
     @app.post("/v1/runs/{run_id}/upload/progress")
     async def upload_progress(run_id: str, request: Request, run: dict = Depends(job_code)):
@@ -500,7 +521,17 @@ def create_app(service: RunService, console: bool = True) -> FastAPI:
         storage: DirectoryStorage = service.storage
 
         @app.put("/v1/storage/{key:path}")
-        async def storage_put(key: str, request: Request, exp: str = "", sig: str = ""):
+        async def storage_put(key: str, request: Request, exp: str = "", sig: str = "",
+                              upload_id: str = "", part: str = ""):
+            if upload_id or part:
+                # one part of an object uploaded in parts
+                if not storage.verify_part(key, upload_id, part, exp, sig):
+                    raise HTTPException(403, "Bad or expired signature")
+                try:
+                    etag = storage.put_part(key, upload_id, int(part), await request.body())
+                except ValueError:
+                    raise HTTPException(404, "No such upload")
+                return Response(status_code=200, headers={"ETag": f'"{etag}"'})
             if not storage.verify("PUT", key, exp, sig):
                 raise HTTPException(403, "Bad or expired signature")
             data = await request.body()

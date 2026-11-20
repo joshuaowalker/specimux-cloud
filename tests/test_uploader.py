@@ -194,6 +194,183 @@ def test_upload_progress_is_logged_and_shown_on_the_run_page(api, tmp_path, capl
     assert "upload" not in client.get(f"/v1/runs/{run['id']}", headers={"X-Service-Key": KEY}).json()
 
 
+def test_a_large_file_goes_up_in_parts_and_a_restart_sends_only_the_rest(api, tmp_path, caplog):
+    import logging
+    client, service, launcher = api
+    service.config.single_put_max, service.config.upload_part_size = 100, 40
+    run = _create(client)
+    folder = tmp_path / "pod5"
+    folder.mkdir()
+    data = bytes(range(256)) * 1                                         # 256 bytes: 7 parts of 40
+    (folder / "big.pod5").write_bytes(data)
+    (folder / "small.pod5").write_bytes(b"POD5")
+
+    class Flaky:
+        """The uploader's HTTP, losing the connection on one part's PUT."""
+        def __init__(self, fail_part):
+            self.fail_part, self.puts = fail_part, []
+
+        def post(self, *a, **kw):
+            return client.post(*a, **kw)
+
+        def get(self, *a, **kw):
+            return client.get(*a, **kw)
+
+        def put(self, url, **kw):
+            part = int(url.split("part=")[1].split("&")[0]) if "part=" in url else None
+            if part is not None and part == self.fail_part:
+                raise httpx.ConnectError("connection lost")
+            self.puts.append(part)
+            return client.put(url, **kw)
+
+    up = Uploader("http://testserver", run["job_code"], folder, settle_s=0)
+    up.client = Flaky(fail_part=4)
+    with pytest.raises(httpx.ConnectError):
+        up.upload(folder / "big.pod5")
+    assert up.client.puts == [1, 2, 3]
+    state = json.loads((folder / ".specimux-upload.json").read_text())
+    assert set(state["parts"]["big.pod5"]["done"]) == {"1", "2", "3"} and state["uploaded"] == {}
+    assert [p.name for p in up.pending()] == ["big.pod5", "small.pod5"]   # not done until assembled
+
+    # started again: the same upload, the parts not yet sent, then the file is made
+    up2 = Uploader("http://testserver", run["job_code"], folder, settle_s=0)
+    up2.client = Flaky(fail_part=None)
+    with caplog.at_level(logging.INFO, logger="specimux_cloud.uploader"):
+        rec = up2.upload(folder / "big.pod5")
+    assert up2.client.puts == [4, 5, 6, 7]
+    assert "carrying on in parts, 3 of 7 already sent" in caplog.text
+    assert rec["size"] == 256 and rec["key"].endswith("/big.pod5")
+    assert service.storage.get(rec["key"]) == data and service.storage.head(rec["key"]).etag == rec["etag"]
+    state = json.loads((folder / ".specimux-upload.json").read_text())
+    assert "parts" not in state and set(state["uploaded"]) == {"big.pod5"}
+    # a small file beside it still goes in one PUT, and the run completes with both
+    up2.upload(folder / "small.pod5")
+    assert up2.client.puts[-1] is None
+    result = up2.run(once=True)
+    status = client.get(f"/v1/runs/{run['id']}", headers={"X-Service-Key": KEY}).json()
+    assert sorted(m["key"].rsplit("/", 1)[-1] for m in status["manifest"]) == ["big.pod5", "small.pod5"]
+    assert result["state"] in ("running", "input_complete")
+
+
+def test_a_file_that_changed_since_its_parts_were_sent_starts_over(api, tmp_path):
+    client, service, _ = api
+    service.config.single_put_max, service.config.upload_part_size = 100, 40
+    run = _create(client)
+    folder = tmp_path / "pod5"
+    folder.mkdir()
+    (folder / "big.pod5").write_bytes(b"A" * 150)
+    up = Uploader("http://testserver", run["job_code"], folder, settle_s=0)
+    _patch_client(up, client)
+    up.parts["big.pod5"] = {"key": "k", "upload_id": "0" * 32, "part_size": 40, "count": 4, "size": 150,
+                            "md5": "not this file's", "done": {"1": "x"}}
+    rec = up.upload(folder / "big.pod5")
+    assert service.storage.get(rec["key"]) == b"A" * 150 and up.parts == {}
+
+
+def test_a_service_that_takes_no_parts_refuses_a_file_over_one_put_plainly(api, tmp_path, monkeypatch):
+    import specimux_cloud.uploader.cli as up_cli
+    monkeypatch.setattr(up_cli, "SINGLE_PUT_MAX", 100)   # the service's own limit stays 5 GB: it offers one PUT
+    client, service, _ = api
+    run = _create(client)
+    folder = tmp_path / "pod5"
+    folder.mkdir()
+    (folder / "big.pod5").write_bytes(b"A" * 150)
+    up = Uploader("http://testserver", run["job_code"], folder, settle_s=0)
+    _patch_client(up, client)
+    with pytest.raises(SystemExit, match="more than one upload carries"):
+        up.upload(folder / "big.pod5")
+
+
+class _RefusingStorage:
+    """The uploader's HTTP, with storage refusing part 3's PUT ``refusals``
+    times (as S3 refuses an address that has expired), and a log of the
+    address requests and PUTs in the order they were made."""
+
+    def __init__(self, client, refusals):
+        self.client, self.refusals, self.calls = client, refusals, []
+
+    def post(self, url, **kw):
+        if url.endswith("/uploads/parts"):
+            self.calls.append(("address", kw["json"]["parts"]))
+        return self.client.post(url, **kw)
+
+    def get(self, *a, **kw):
+        return self.client.get(*a, **kw)
+
+    def put(self, url, **kw):
+        part = int(url.split("part=")[1].split("&")[0])
+        self.calls.append(("put", part))
+        if part == 3 and self.refusals:
+            self.refusals -= 1
+            return httpx.Response(403, request=httpx.Request("PUT", url))
+        return self.client.put(url, **kw)
+
+
+def test_a_part_storage_refuses_is_sent_again_with_a_fresh_address(api, tmp_path, monkeypatch):
+    import specimux_cloud.uploader.cli as up_cli
+    monkeypatch.setattr(up_cli, "PART_RETRY_S", 0)
+    client, service, _ = api
+    service.config.single_put_max, service.config.upload_part_size = 100, 40
+    run = _create(client)
+    folder = tmp_path / "pod5"
+    folder.mkdir()
+    data = bytes(range(200))                                             # 5 parts of 40
+    (folder / "big.pod5").write_bytes(data)
+    up = Uploader("http://testserver", run["job_code"], folder, settle_s=0)
+    up.client = _RefusingStorage(client, refusals=1)
+    rec = up.upload(folder / "big.pod5")
+    assert service.storage.get(rec["key"]) == data
+    # each part's address is asked for just before its PUT, and the refused
+    # part gets a fresh one
+    assert up.client.calls == [c for n in (1, 2, 3, 3, 4, 5) for c in (("address", [n]), ("put", n))]
+
+
+def test_a_part_refused_every_time_stops_with_the_parts_sent_kept(api, tmp_path, monkeypatch):
+    import specimux_cloud.uploader.cli as up_cli
+    monkeypatch.setattr(up_cli, "PART_RETRY_S", 0)
+    client, service, _ = api
+    service.config.single_put_max, service.config.upload_part_size = 100, 40
+    run = _create(client)
+    folder = tmp_path / "pod5"
+    folder.mkdir()
+    (folder / "big.pod5").write_bytes(bytes(range(200)))
+    up = Uploader("http://testserver", run["job_code"], folder, settle_s=0)
+    up.client = _RefusingStorage(client, refusals=up_cli.PART_TRIES)
+    with pytest.raises(httpx.HTTPStatusError):
+        up.upload(folder / "big.pod5")
+    assert up.client.calls.count(("put", 3)) == up_cli.PART_TRIES and ("put", 4) not in up.client.calls
+    state = json.loads((folder / ".specimux-upload.json").read_text())
+    assert set(state["parts"]["big.pod5"]["done"]) == {"1", "2"}
+
+
+def test_progress_runs_across_parts_quicker_than_its_period(api, tmp_path, monkeypatch, caplog):
+    """A part of 128 MB can go up in less than PROGRESS_LOG_S on a fast
+    link; the log and the run page still show the file's progress."""
+    import logging
+    import types
+    import specimux_cloud.uploader.cli as up_cli
+    # each reading of the uploader's clock is 5 s after the last; a part of
+    # 40 bytes is one chunk, so one reading a part
+    ticks = iter(range(0, 10_000, 5))
+    monkeypatch.setattr(up_cli, "time", types.SimpleNamespace(
+        monotonic=lambda: float(next(ticks)), time=time.time, sleep=lambda s: None))
+    client, service, _ = api
+    service.config.single_put_max, service.config.upload_part_size = 100, 40
+    run = _create(client)
+    folder = tmp_path / "pod5"
+    folder.mkdir()
+    (folder / "big.pod5").write_bytes(bytes(range(200)))                 # 5 parts of 40
+    up = Uploader("http://testserver", run["job_code"], folder, settle_s=0)
+    _patch_client(up, client)
+    reports = []
+    monkeypatch.setattr(up, "report_progress", lambda name, sent, size, rate: reports.append(sent))
+    with caplog.at_level(logging.INFO, logger="specimux_cloud.uploader"):
+        up.upload(folder / "big.pod5")
+    # started at 0 s; the parts end at 5, 10, 15, 20 and 25 s
+    assert "big.pod5: 40% of" in caplog.text and "big.pod5: 80% of" in caplog.text   # at 10 and 20 s
+    assert reports == [120]                                                        # at 15 s
+
+
 def test_an_older_run_api_is_not_sent_progress_again(tmp_path):
     folder = tmp_path / "reads"
     folder.mkdir()

@@ -51,6 +51,30 @@ def test_s3_storage(tmp_path):
     assert s.list("runs") == []
 
 
+def test_s3_storage_takes_an_object_in_parts():
+    boto3.client("s3", region_name=REGION).create_bucket(
+        Bucket="test-bucket", CreateBucketConfiguration={"LocationConstraint": REGION})
+    s = S3Storage("test-bucket", region=REGION)
+    key = "archives/u/a1/pod5/big.pod5"
+    upload = s.multipart_start(key)
+    url = s.presign_part(key, upload, 2, expires_s=60)
+    assert "big.pod5" in url and "partNumber=2" in url and "uploadId=" in url and "Signature=" in url
+    # the parts as a client's PUTs leave them (S3 takes no part but the last under 5 MiB)
+    first, last = b"A" * (5 * 1024 * 1024), b"BCD"
+    etags = [s.client.upload_part(Bucket="test-bucket", Key=key, UploadId=upload, PartNumber=n, Body=body)["ETag"]
+             for n, body in ((1, first), (2, last))]
+    assert s.head(key) is None
+    with pytest.raises(ValueError):
+        s.multipart_complete(key, upload, [{"number": 1, "etag": "0" * 32}, {"number": 2, "etag": etags[1]}])
+    info = s.multipart_complete(key, upload, [{"number": 1, "etag": etags[0].strip('"')},
+                                              {"number": 2, "etag": etags[1]}])     # quoted or not
+    assert (info.key, info.size) == (key, len(first) + 3) and info.etag.endswith("-2")
+    assert s.head(key) == info and s.get(key)[-3:] == b"BCD"
+    other = s.multipart_start(key)
+    s.multipart_abort(key, other)
+    s.multipart_abort(key, other)                                                    # already gone is fine
+
+
 def test_sqs_queue_redelivers_until_acked():
     q = SqsQueue(prefix="t", region=REGION, visibility_s=1)
     q.send("r1", {"command": "watch"})

@@ -120,6 +120,17 @@ EXTRA_WORKER_MIN_BYTES = 1_000_000_000
 RERUN_STARTS = ("basecall", "engine")
 RERUN_INHERITS = ("profile", "min_reads", "reprocess_ratio", "workers", "vcpus", "tools")
 RERUN_COPY_WORKERS = 16
+# One presigned PUT carries at most 5 GB (S3's limit), and MinKNOW writes
+# POD5 files larger than that. A file whose announced size is over
+# SINGLE_PUT_MAX goes up in parts of UPLOAD_PART_SIZE, each a presigned PUT
+# of its own, and is assembled in storage ("Files over 5 GB" in
+# docs/DESIGN.md). S3 takes 10,000 parts an object; a request for part
+# addresses names at most UPLOAD_PART_URLS_MAX of them, since each address
+# is good for an hour and a part should be asked for close to when it is sent.
+SINGLE_PUT_MAX = 5 * 1024 ** 3
+UPLOAD_PART_SIZE = 128 * 1024 ** 2
+UPLOAD_PARTS_MAX = 10_000
+UPLOAD_PART_URLS_MAX = 100
 # S3 moves archives/ to Glacier Deep Archive 30 days after upload
 # (infra/stack.py), and restoring from it is not built: a run over an
 # archive older than this is refused, with two days' margin so no job
@@ -218,6 +229,10 @@ class ServiceConfig:
     # uploaded at all (a lab may create the run days before sequencing ends)
     upload_idle_s: float = 24 * 3600
     created_idle_s: float = 7 * 24 * 3600
+    # a file announced as larger than single_put_max is uploaded in parts
+    # of upload_part_size (SINGLE_PUT_MAX above)
+    single_put_max: int = SINGLE_PUT_MAX
+    upload_part_size: int = UPLOAD_PART_SIZE
     # a live run whose uploads stop for this long is completed with what
     # arrived, so its engine finalizes instead of idling on an instance
     live_idle_s: float = 3 * 3600
@@ -935,6 +950,11 @@ class RunService:
                 # what a host may send in spec.tools; absent when this
                 # service's specimux-suite cannot apply them
                 **({"tools": TOOL_SETTINGS} if suite_takes_tool_settings() else {}),
+                # a file announced (sizes) as over single_put_max bytes is
+                # uploaded in parts of part_size; a host that finds this
+                # here may send files of any size
+                "uploads": {"single_put_max": self.config.single_put_max,
+                            "part_size": self.config.upload_part_size},
                 "versions": {"suite": suite_version, "cloud": cloud_version}}
 
     # --- authorization helpers ---
@@ -1190,16 +1210,14 @@ class RunService:
 
     # --- uploads (C5) ---
 
-    def presign_uploads(self, run_id: str, names: list[str]) -> dict:
-        run = self.get_run(run_id)
-        kind = run["spec"].get("input", "fastq")
-        urls = {}
-        for name in names:
-            if "/" in name or name.startswith(".") or not name:
-                raise ServiceError(400, f"Invalid file name: {name!r}")
-            key = f"{self.archive_prefix(run)}/{kind}/{name}"
-            urls[name] = {"key": key, "url": self.storage.presign_put(key)}
-        # the idle clock (expire_idle_uploads) runs from the last request
+    def _upload_key(self, run: dict, name) -> str:
+        if not isinstance(name, str) or "/" in name or name.startswith(".") or not name:
+            raise ServiceError(400, f"Invalid file name: {name!r}")
+        return f"{self.archive_prefix(run)}/{run['spec'].get('input', 'fastq')}/{name}"
+
+    def _upload_activity(self, run_id: str) -> dict:
+        """An upload request: the idle clock (expire_idle_uploads) runs from
+        the last one. Refused once the run no longer takes uploads."""
         def touch(cur: dict) -> dict:
             if not self.uploads_open(cur):
                 raise ConflictError(f"run {run_id} is {cur['state']}")
@@ -1209,12 +1227,104 @@ class RunService:
         except ConflictError:
             raise ServiceError(409, f"Uploads are closed: run is {self.get_run(run_id)['state']}")
         self._forget_upload_listing(run_id)
+        return run
+
+    def presign_uploads(self, run_id: str, names: list[str], sizes: Optional[dict] = None) -> dict:
+        """Where to PUT each file. A file whose size is given (``sizes``,
+        bytes by name) and is over what one PUT carries gets an upload in
+        parts instead of a URL: ``{"multipart": {"upload_id", "part_size",
+        "parts"}}``; its part addresses come from ``presign_upload_parts``
+        and ``assemble_upload`` makes the object."""
+        run = self.get_run(run_id)
+        if sizes is not None and not isinstance(sizes, dict):
+            raise ServiceError(400, "sizes: bytes by file name")
+        keys = {name: self._upload_key(run, name) for name in names}
+        for name in names:
+            size = (sizes or {}).get(name)
+            if size is not None and (isinstance(size, bool) or not isinstance(size, int) or size < 0):
+                raise ServiceError(400, f"sizes: {name} needs its size in bytes")
+            if size is not None and -(-size // self.config.upload_part_size) > UPLOAD_PARTS_MAX:
+                raise ServiceError(400, f"{name} is too large to upload ({size} bytes)")
+        if not self.uploads_open(run):
+            raise ServiceError(409, f"Uploads are closed: run is {run['state']}")
+        urls = {}
+        for name, key in keys.items():
+            size = (sizes or {}).get(name)
+            if size is not None and size > self.config.single_put_max:
+                part = self.config.upload_part_size
+                urls[name] = {"key": key, "multipart": {"upload_id": self.storage.multipart_start(key),
+                                                        "part_size": part, "parts": -(-size // part)}}
+            else:
+                urls[name] = {"key": key, "url": self.storage.presign_put(key)}
+        run = self._upload_activity(run_id)
         # A live run's engine starts with its first upload request (or when
         # an engine slot frees); a batch run's on complete
         if run["spec"].get("mode") == "live" and run["state"] == UPLOADING \
                 and not stage_of(run, ENGINE_STAGE).get("active"):
             self._try_launch(run_id)
         return {"run_id": run_id, "uploads": urls}
+
+    def presign_upload_parts(self, run_id: str, name: str, upload_id, numbers) -> dict:
+        """PUT addresses for parts of a file being uploaded in parts, by
+        part number. Asking again for a part is fine: a part sent twice is
+        the last one sent."""
+        run = self.get_run(run_id)
+        key = self._upload_key(run, name)
+        if not isinstance(upload_id, str) or not upload_id:
+            raise ServiceError(400, "upload_id: the one the upload was started with")
+        if not isinstance(numbers, list) or not numbers or len(numbers) > UPLOAD_PART_URLS_MAX \
+                or any(isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= UPLOAD_PARTS_MAX
+                       for n in numbers):
+            raise ServiceError(400, f"parts: 1 to {UPLOAD_PART_URLS_MAX} part numbers, each from 1 to "
+                                    f"{UPLOAD_PARTS_MAX}")
+        self._upload_activity(run_id)
+        try:
+            urls = {str(n): self.storage.presign_part(key, upload_id, n) for n in numbers}
+        except ValueError as e:
+            raise ServiceError(409, f"{name}: {e}")
+        return {"run_id": run_id, "file": name, "upload_id": upload_id, "parts": urls}
+
+    def assemble_upload(self, run_id: str, name: str, upload_id, parts, size=None) -> dict:
+        """Make the object from a file's uploaded parts (``{"number",
+        "etag"}`` each, the ETag its PUT answered with). With ``size``, the
+        object must come out that many bytes, or it is not kept. The answer
+        is the manifest's entry for the file."""
+        run = self.get_run(run_id)
+        key = self._upload_key(run, name)
+        if not isinstance(upload_id, str) or not upload_id:
+            raise ServiceError(400, "upload_id: the one the upload was started with")
+        if size is not None and (isinstance(size, bool) or not isinstance(size, int) or size < 0):
+            raise ServiceError(400, "size: the file's size in bytes")
+        clean = []
+        if not isinstance(parts, list) or not parts or len(parts) > UPLOAD_PARTS_MAX:
+            raise ServiceError(400, "parts: every part of the file, as {number, etag}")
+        for p in parts:
+            number, etag = (p.get("number"), p.get("etag")) if isinstance(p, dict) else (None, None)
+            etag = etag.strip('"') if isinstance(etag, str) else ""
+            if isinstance(number, bool) or not isinstance(number, int) or not 1 <= number <= UPLOAD_PARTS_MAX \
+                    or not etag or len(etag) > 64 or any(c not in "0123456789abcdefABCDEF-" for c in etag):
+                raise ServiceError(400, "parts: every part of the file, as {number, etag}")
+            clean.append({"number": number, "etag": etag})
+        clean.sort(key=lambda p: p["number"])
+        if len({p["number"] for p in clean}) != len(clean):
+            raise ServiceError(400, "parts: a part is listed twice")
+        if not self.uploads_open(run):
+            raise ServiceError(409, f"Uploads are closed: run is {run['state']}")
+        try:
+            info = self.storage.multipart_complete(key, upload_id, clean)
+        except ValueError as e:
+            # The same request again, its first answer lost on the way: the
+            # parts are gone because the object is made
+            info = self.storage.head(key)
+            if info is None or size is None or info.size != size:
+                raise ServiceError(409, f"{name} could not be assembled from its parts: {e}")
+        if size is not None and info.size != size:
+            # a part left out of the list: not the file, so not kept
+            self.storage.delete(key)
+            raise ServiceError(409, f"{name} came out {info.size} bytes from its parts, not the {size} announced; "
+                                    "upload it again")
+        self._upload_activity(run_id)
+        return {"run_id": run_id, "file": name, "key": info.key, "size": info.size, "etag": info.etag}
 
     def _upload_received(self, run: dict) -> dict:
         """What has arrived so far: whole files in the archive (a file shows

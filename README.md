@@ -69,6 +69,11 @@ service processes files as they arrive, so the dashboard fills while you
 sequence; for a batch run, uploading during sequencing just means the
 upload is done when sequencing is.
 
+A file over 5 GB (MinKNOW writes POD5 files that large) is sent in parts
+of 128 MB and put together by the service. If the connection drops, or
+you stop the uploader and start it again, it carries on with the parts
+not yet sent.
+
 Reads under MinKNOW's `fastq_fail` and `pod5_fail` folders are left out;
 `--include-failed` sends them too.
 
